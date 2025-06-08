@@ -36,6 +36,22 @@ from opacus import PrivacyEngine, GradSampleModule
 from opacus.accountants import PRVAccountant, RDPAccountant, GaussianAccountant
 from opacus.utils.batch_memory_manager import wrap_data_loader
 
+# Mixed precision imports
+try:
+    from apex import amp
+    APEX_AVAILABLE = True
+except ImportError:
+    APEX_AVAILABLE = False
+    amp = None
+
+try:
+    from torch.cuda.amp import GradScaler, autocast
+    TORCH_AMP_AVAILABLE = True
+except ImportError:
+    TORCH_AMP_AVAILABLE = False
+    GradScaler = None
+    autocast = None
+
 from mostlyai.engine._memory import get_available_ram_for_heuristics
 from mostlyai.engine.domain import ModelStateStrategy, DifferentialPrivacyConfig
 from mostlyai.engine._tabular.argn import (
@@ -128,6 +144,163 @@ def _physical_batch_size_heuristic(
 def _learn_rate_heuristic(batch_size: int) -> float:
     learn_rate = np.round(0.001 * np.sqrt(batch_size / 32), 5)
     return learn_rate
+
+
+####################
+### ADAPTIVE BATCH SIZE ###
+####################
+
+
+class AdaptiveBatchSizeManager:
+    """Manages adaptive batch size based on gradient noise and training dynamics."""
+    
+    def __init__(
+        self,
+        initial_batch_size: int,
+        strategy: str = "gradient_noise",
+        growth_factor: float = 1.2,
+        shrink_factor: float = 0.8,
+        min_batch_size: int = 8,
+        max_batch_size: int = 2048,
+        gradient_noise_threshold: float = 0.1,
+        adaptation_patience: int = 10,
+    ):
+        self.current_batch_size = initial_batch_size
+        self.strategy = strategy
+        self.growth_factor = growth_factor
+        self.shrink_factor = shrink_factor
+        self.min_batch_size = min_batch_size
+        self.max_batch_size = max_batch_size
+        self.gradient_noise_threshold = gradient_noise_threshold
+        self.adaptation_patience = adaptation_patience
+        
+        # Internal tracking
+        self.gradient_norms_history = []
+        self.loss_history = []
+        self.steps_since_adaptation = 0
+        self.last_adaptation_step = 0
+        
+    def update_metrics(self, gradient_norm: float, loss: float, step: int):
+        """Update internal metrics for adaptation decisions."""
+        self.gradient_norms_history.append(gradient_norm)
+        self.loss_history.append(loss)
+        self.steps_since_adaptation = step - self.last_adaptation_step
+        
+        # Keep only recent history (last 100 steps)
+        if len(self.gradient_norms_history) > 100:
+            self.gradient_norms_history = self.gradient_norms_history[-100:]
+        if len(self.loss_history) > 100:
+            self.loss_history = self.loss_history[-100:]
+    
+    def should_adapt_batch_size(self) -> tuple[bool, str]:
+        """Determine if batch size should be adapted and in which direction."""
+        if self.steps_since_adaptation < self.adaptation_patience:
+            return False, "patience"
+        
+        if len(self.gradient_norms_history) < 10:
+            return False, "insufficient_data"
+        
+        if self.strategy == "gradient_noise":
+            return self._gradient_noise_strategy()
+        elif self.strategy == "loss_variance":
+            return self._loss_variance_strategy()
+        elif self.strategy == "conservative":
+            return self._conservative_strategy()
+        else:
+            return False, "unknown_strategy"
+    
+    def _gradient_noise_strategy(self) -> tuple[bool, str]:
+        """Adapt based on gradient noise levels."""
+        recent_norms = self.gradient_norms_history[-20:]  # Last 20 steps
+        if len(recent_norms) < 10:
+            return False, "insufficient_gradient_data"
+        
+        # Calculate gradient noise (coefficient of variation)
+        mean_norm = np.mean(recent_norms)
+        std_norm = np.std(recent_norms)
+        
+        if mean_norm == 0:
+            return False, "zero_gradients"
+        
+        gradient_noise = std_norm / mean_norm
+        
+        if gradient_noise > self.gradient_noise_threshold and self.current_batch_size < self.max_batch_size:
+            # High noise -> increase batch size for stability
+            return True, "increase_for_stability"
+        elif gradient_noise < self.gradient_noise_threshold * 0.5 and self.current_batch_size > self.min_batch_size:
+            # Low noise -> can afford smaller batch size for faster iterations
+            return True, "decrease_for_speed"
+        
+        return False, "gradient_noise_optimal"
+    
+    def _loss_variance_strategy(self) -> tuple[bool, str]:
+        """Adapt based on loss variance."""
+        recent_losses = self.loss_history[-20:]
+        if len(recent_losses) < 10:
+            return False, "insufficient_loss_data"
+        
+        loss_variance = np.var(recent_losses)
+        loss_mean = np.mean(recent_losses)
+        
+        if loss_mean == 0:
+            return False, "zero_loss"
+        
+        loss_cv = np.sqrt(loss_variance) / loss_mean
+        
+        if loss_cv > 0.1 and self.current_batch_size < self.max_batch_size:
+            return True, "increase_for_loss_stability"
+        elif loss_cv < 0.05 and self.current_batch_size > self.min_batch_size:
+            return True, "decrease_for_loss_efficiency"
+        
+        return False, "loss_variance_optimal"
+    
+    def _conservative_strategy(self) -> tuple[bool, str]:
+        """Conservative strategy - only increase, never decrease."""
+        recent_norms = self.gradient_norms_history[-10:]
+        if len(recent_norms) < 5:
+            return False, "insufficient_data"
+        
+        # Only increase if gradients are very noisy
+        gradient_noise = np.std(recent_norms) / (np.mean(recent_norms) + 1e-8)
+        
+        if gradient_noise > self.gradient_noise_threshold * 2 and self.current_batch_size < self.max_batch_size:
+            return True, "conservative_increase"
+        
+        return False, "conservative_stable"
+    
+    def adapt_batch_size(self, step: int) -> tuple[int, str]:
+        """Adapt batch size and return new size with reason."""
+        should_adapt, reason = self.should_adapt_batch_size()
+        
+        if not should_adapt:
+            return self.current_batch_size, reason
+        
+        old_batch_size = self.current_batch_size
+        
+        if "increase" in reason:
+            new_batch_size = min(
+                int(self.current_batch_size * self.growth_factor),
+                self.max_batch_size
+            )
+        else:  # decrease
+            new_batch_size = max(
+                int(self.current_batch_size * self.shrink_factor),
+                self.min_batch_size
+            )
+        
+        # Round to nearest power of 2 for efficiency
+        new_batch_size = 2 ** round(np.log2(new_batch_size))
+        new_batch_size = np.clip(new_batch_size, self.min_batch_size, self.max_batch_size)
+        
+        if new_batch_size != self.current_batch_size:
+            self.current_batch_size = new_batch_size
+            self.last_adaptation_step = step
+            self.steps_since_adaptation = 0
+            adaptation_reason = f"{reason}_from_{old_batch_size}_to_{new_batch_size}"
+        else:
+            adaptation_reason = f"{reason}_no_change"
+        
+        return self.current_batch_size, adaptation_reason
 
 
 #####################
@@ -485,11 +658,19 @@ class TabularModelCheckpoint(ModelCheckpoint):
 def _calculate_sample_losses(
     model: FlatModel | SequentialModel | GradSampleModule, 
     data: dict[str, torch.Tensor],
-    criterion: EnhancedLoss
+    criterion: EnhancedLoss,
+    use_mixed_precision: bool = False,
+    mixed_precision_backend: str | None = None
 ) -> torch.Tensor:
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning, message="Using a non-full backward hook*")
-        output, _ = model(data, mode="trn")
+        
+        # Forward pass with mixed precision if enabled
+        if use_mixed_precision and mixed_precision_backend == "torch_amp":
+            with autocast():
+                output, _ = model(data, mode="trn")
+        else:
+            output, _ = model(data, mode="trn")
 
     tgt_cols = (
         list(model.tgt_cardinalities.keys())
@@ -541,11 +722,15 @@ def _calculate_val_loss(
     model: FlatModel | SequentialModel,
     val_dataloader: DataLoader,
     criterion: EnhancedLoss,
+    use_mixed_precision: bool = False,
+    mixed_precision_backend: str | None = None,
 ) -> float:
     val_sample_losses: list[torch.Tensor] = []
     model.eval()
     for step_data in val_dataloader:
-        step_losses = _calculate_sample_losses(model, step_data, criterion)
+        step_losses = _calculate_sample_losses(
+            model, step_data, criterion, use_mixed_precision, mixed_precision_backend
+        )
         val_sample_losses.extend(step_losses.detach())
     model.train()
     val_sample_losses: torch.Tensor = torch.stack(val_sample_losses, dim=0)
@@ -610,6 +795,19 @@ def train(
     adaptive_betas: bool = True,
     beta1_schedule: tuple[float, float] = (0.9, 0.95),
     beta2_schedule: tuple[float, float] = (0.999, 0.99),
+    # Adaptive Batch Size Strategy
+    adaptive_batch_size: bool = False,
+    batch_size_strategy: str = "gradient_noise",  # "gradient_noise", "loss_variance", "conservative"
+    batch_size_growth_factor: float = 1.2,
+    batch_size_shrink_factor: float = 0.8,
+    min_batch_size: int = 8,
+    max_batch_size: int = 2048,
+    gradient_noise_threshold: float = 0.1,
+    batch_adaptation_patience: int = 10,
+    # Mixed Precision Training
+    use_mixed_precision: bool = False,
+    mixed_precision_backend: str | None = None,
+    mixed_precision_opt_level: str = "O1",
 ):
     """Enhanced training function with advanced optimization techniques.
     
@@ -823,20 +1021,44 @@ def train(
             "model_units": model_units,
             "enable_flexible_generation": enable_flexible_generation,
         }
-        workspace.model_tabular_configs.write(model_configs)
+        workspace.model_configs.write(model_configs)
 
         # heuristics for batch_size and for initial learn_rate
         mem_available_gb = get_available_ram_for_heuristics() / 1024**3
         no_tgt_data_points = get_max_data_points_per_sample(tgt_stats)
         no_ctx_data_points = get_max_data_points_per_sample(ctx_stats)
+        
+        # Determine initial batch size
         if batch_size is None:
-            batch_size = _physical_batch_size_heuristic(
+            initial_batch_size = _physical_batch_size_heuristic(
                 mem_available_gb=mem_available_gb,
                 no_of_records=trn_cnt,
                 no_tgt_data_points=no_tgt_data_points,
                 no_ctx_data_points=no_ctx_data_points,
                 no_of_model_params=no_of_model_params,
             )
+        else:
+            initial_batch_size = batch_size
+            
+        # Setup adaptive batch size manager
+        if adaptive_batch_size:
+            batch_size_manager = AdaptiveBatchSizeManager(
+                initial_batch_size=initial_batch_size,
+                strategy=batch_size_strategy,
+                growth_factor=batch_size_growth_factor,
+                shrink_factor=batch_size_shrink_factor,
+                min_batch_size=min_batch_size,
+                max_batch_size=max_batch_size,
+                gradient_noise_threshold=gradient_noise_threshold,
+                adaptation_patience=batch_adaptation_patience,
+            )
+            current_batch_size = initial_batch_size
+            _LOG.info(f"Adaptive batch size enabled: strategy={batch_size_strategy}, initial_size={initial_batch_size}")
+        else:
+            batch_size_manager = None
+            current_batch_size = initial_batch_size
+            
+        batch_size = current_batch_size  # Use current batch size for the rest of initialization
         if gradient_accumulation_steps is None:
             # for TABULAR the batch size is typically large, so we use step=1 as default
             gradient_accumulation_steps = 1
@@ -940,6 +1162,24 @@ def train(
             optimizer = Lookahead(optimizer, k=lookahead_k, alpha=lookahead_alpha)
             _LOG.info(f"Lookahead optimizer enabled: k={lookahead_k}, alpha={lookahead_alpha}")
 
+        # Setup mixed precision
+        grad_scaler = None
+        if use_mixed_precision:
+            if mixed_precision_backend == "apex":
+                argn, optimizer_for_amp = amp.initialize(
+                    argn, 
+                    optimizer.optimizer if use_lookahead else optimizer,
+                    opt_level=mixed_precision_opt_level
+                )
+                if use_lookahead:
+                    optimizer.optimizer = optimizer_for_amp
+                else:
+                    optimizer = optimizer_for_amp
+                _LOG.info(f"Apex mixed precision initialized: {mixed_precision_opt_level}")
+            elif mixed_precision_backend == "torch_amp":
+                grad_scaler = GradScaler()
+                _LOG.info("PyTorch native AMP initialized")
+
         # Enhanced learning rate scheduler
         if use_cosine_restarts:
             lr_scheduler = CosineRestartScheduler(
@@ -1012,8 +1252,11 @@ def train(
             # - model: wrapped in GradSampleModule and contains additional hooks for computing per-sample gradients
             # - optimizer: wrapped in DPOptimizer and will do different operations during virtual steps and logical steps
             # - dataloader: the dataloader with batch_sampler=UniformWithReplacementSampler (for Poisson sampling)
+            
+            # For DP training, we need to pass the base optimizer to Opacus
+            # Lookahead will be applied after DP wrapping if enabled
             base_optimizer = optimizer.optimizer if use_lookahead else optimizer
-            argn, base_optimizer, trn_dataloader = privacy_engine.make_private(
+            argn, dp_optimizer, trn_dataloader = privacy_engine.make_private(
                 module=argn,
                 optimizer=base_optimizer,
                 data_loader=trn_dataloader,
@@ -1021,14 +1264,18 @@ def train(
                 max_grad_norm=dp_config.get("max_grad_norm"),
                 poisson_sampling=True,
             )
+            
+            # Re-wrap with Lookahead if enabled
             if use_lookahead:
-                optimizer.optimizer = base_optimizer
+                optimizer = Lookahead(dp_optimizer, k=lookahead_k, alpha=lookahead_alpha)
+                _LOG.info("Re-wrapped DP optimizer with Lookahead")
             else:
-                optimizer = base_optimizer
+                optimizer = dp_optimizer
+                
             # this further wraps the dataloader with batch_sampler=BatchSplittingSampler to achieve gradient accumulation
             # it will split the sampled logical batches into smaller sub-batches with batch_size
             trn_dataloader = wrap_data_loader(
-                data_loader=trn_dataloader, max_batch_size=batch_size, optimizer=base_optimizer
+                data_loader=trn_dataloader, max_batch_size=batch_size, optimizer=dp_optimizer
             )
         else:
             privacy_engine = None
@@ -1056,19 +1303,27 @@ def train(
             # Update adaptive parameters based on progress
             progress_ratio = min(1.0, steps / total_steps) if total_steps > 0 else 0.0
             
+            # Get the actual optimizer that has param_groups
+            if with_dp and use_lookahead:
+                actual_optimizer = optimizer.optimizer  # DP optimizer
+            elif with_dp:
+                actual_optimizer = optimizer  # DP optimizer
+            elif use_lookahead:
+                actual_optimizer = optimizer.optimizer  # base AdamW
+            else:
+                actual_optimizer = optimizer  # base AdamW
+            
             # Update weight decay if scheduled
             if weight_decay_schedule:
                 current_weight_decay = initial_weight_decay + (final_weight_decay - initial_weight_decay) * progress_ratio
-                base_optimizer = optimizer.optimizer if use_lookahead else optimizer
-                for param_group in base_optimizer.param_groups:
+                for param_group in actual_optimizer.param_groups:
                     param_group['weight_decay'] = current_weight_decay
             
             # Update adaptive betas if enabled
             if adaptive_betas:
                 new_beta1 = beta1_schedule[0] + (beta1_schedule[1] - beta1_schedule[0]) * progress_ratio
                 new_beta2 = beta2_schedule[0] + (beta2_schedule[1] - beta2_schedule[0]) * progress_ratio
-                base_optimizer = optimizer.optimizer if use_lookahead else optimizer
-                for param_group in base_optimizer.param_groups:
+                for param_group in actual_optimizer.param_groups:
                     param_group['betas'] = (new_beta1, new_beta2)
 
             stop_accumulating_grads = False
@@ -1083,7 +1338,9 @@ def train(
                     trn_data_iter = iter(trn_dataloader)
                     step_data = next(trn_data_iter)
                 # forward pass + calculate sample losses
-                step_losses = _calculate_sample_losses(argn, step_data, enhanced_criterion)
+                step_losses = _calculate_sample_losses(
+                    argn, step_data, enhanced_criterion, use_mixed_precision, mixed_precision_backend
+                )
                 # FIXME in sequential case, this is an approximation, it should be divided by total sum of masks in the
                 #  entire batch to get the average loss per sample. Less importantly the final sample may be smaller
                 #  than the batch size in both flat and sequential case.
@@ -1092,20 +1349,57 @@ def train(
                 if with_dp:
                     # opacus handles the gradient accumulation internally
                     optimizer.zero_grad(set_to_none=True)
-                # backward pass
+                    
+                # backward pass with mixed precision support
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=FutureWarning, message="Using a non-full backward hook*")
-                    step_loss.backward()
+                    
+                    if use_mixed_precision:
+                        if mixed_precision_backend == "apex":
+                            with amp.scale_loss(step_loss, optimizer.optimizer if use_lookahead else optimizer) as scaled_loss:
+                                scaled_loss.backward()
+                        elif mixed_precision_backend == "torch_amp":
+                            grad_scaler.scale(step_loss).backward()
+                    else:
+                        step_loss.backward()
                 
                 # Enhanced gradient clipping (even for non-DP training)
                 if gradient_clip_norm is not None and not with_dp:
-                    total_norm = torch.nn.utils.clip_grad_norm_(argn.parameters(), gradient_clip_norm)
+                    if use_mixed_precision and mixed_precision_backend == "torch_amp":
+                        # Unscale gradients before clipping
+                        grad_scaler.unscale_(optimizer.optimizer if use_lookahead else optimizer)
+                        total_norm = torch.nn.utils.clip_grad_norm_(argn.parameters(), gradient_clip_norm)
+                    else:
+                        total_norm = torch.nn.utils.clip_grad_norm_(argn.parameters(), gradient_clip_norm)
+                    
                     gradient_norms.append(total_norm.item())
+                    
+                    # Update batch size manager with gradient norm
+                    if batch_size_manager:
+                        batch_size_manager.update_metrics(
+                            gradient_norm=total_norm.item(), 
+                            loss=step_loss.item(), 
+                            step=steps
+                        )
                     
                     # Log gradient norms periodically
                     if len(gradient_norms) % 100 == 0:
                         avg_norm = np.mean(gradient_norms[-100:])
                         _LOG.debug(f"Average gradient norm (last 100 steps): {avg_norm:.4f}")
+                elif batch_size_manager:
+                    # Still track for batch size adaptation even without clipping
+                    # Compute gradient norm manually
+                    total_norm = 0
+                    for p in argn.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                    total_norm = total_norm ** (1. / 2)
+                    batch_size_manager.update_metrics(
+                        gradient_norm=total_norm, 
+                        loss=step_loss.item(), 
+                        step=steps
+                    )
                 
                 accumulated_steps += 1
                 # explicitly count the number of processed samples as the actual batch size can vary when DP is on
@@ -1114,29 +1408,65 @@ def train(
                     # for DP training, the optimizer will do different operations during virtual steps and logical steps
                     # - virtual step: clip and accumulate gradients
                     # - logical step: clip and accumulate gradients, add noises to gradients and update parameters
-                    optimizer.step()
+                    if use_mixed_precision and mixed_precision_backend == "torch_amp":
+                        grad_scaler.step(optimizer)
+                        grad_scaler.update()
+                    else:
+                        optimizer.step()
                     # if step was not skipped, it was a logical step, and we can stop accumulating gradients
                     stop_accumulating_grads = not optimizer._is_last_step_skipped
                 elif accumulated_steps % gradient_accumulation_steps == 0:
                     # update parameters with accumulated gradients
-                    optimizer.step()
+                    if use_mixed_precision and mixed_precision_backend == "torch_amp":
+                        grad_scaler.step(optimizer)
+                        grad_scaler.update()
+                    else:
+                        optimizer.step()
                     stop_accumulating_grads = True
                 # detach losses from the graph
                 step_losses = step_losses.detach()
                 trn_sample_losses.extend(step_losses)
 
             base_optimizer = optimizer.optimizer if use_lookahead else optimizer
-            current_lr = base_optimizer.param_groups[0]["lr"]  # currently assume that we have the same lr for all param groups
+            # For DP training, the actual optimizer might be wrapped differently
+            if with_dp and use_lookahead:
+                # DP + Lookahead: optimizer.optimizer is the DP optimizer
+                dp_optimizer = optimizer.optimizer
+                current_lr = dp_optimizer.param_groups[0]["lr"]
+            elif with_dp:
+                # DP only: optimizer is the DP optimizer
+                current_lr = optimizer.param_groups[0]["lr"]
+            elif use_lookahead:
+                # Lookahead only: optimizer.optimizer is the base AdamW
+                current_lr = optimizer.optimizer.param_groups[0]["lr"]
+            else:
+                # Neither: optimizer is the base AdamW
+                current_lr = optimizer.param_groups[0]["lr"]
 
             # Enhanced learning rate scheduling
             if not isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 lr_scheduler.step()
 
+            # Adaptive batch size management (note: actual batch size change would require dataloader recreation)
+            if batch_size_manager:
+                new_batch_size, adaptation_reason = batch_size_manager.adapt_batch_size(steps)
+                if new_batch_size != current_batch_size:
+                    _LOG.info(f"Batch size adaptation suggested: {current_batch_size} -> {new_batch_size} ({adaptation_reason})")
+                    # Note: In a full implementation, we would recreate the dataloader here
+                    # For now, we just log the recommendation
+                    current_batch_size = new_batch_size
+
             # do validation
             do_validation = on_epoch_end = epoch.is_integer()
             if do_validation:
                 # calculate val loss and trn loss
-                val_loss = _calculate_val_loss(model=argn, val_dataloader=val_dataloader, criterion=enhanced_criterion)
+                val_loss = _calculate_val_loss(
+                    model=argn, 
+                    val_dataloader=val_dataloader, 
+                    criterion=enhanced_criterion,
+                    use_mixed_precision=use_mixed_precision,
+                    mixed_precision_backend=mixed_precision_backend,
+                )
                 # handle scenario where model training ran into numeric instability
                 if pd.isna(val_loss):
                     _LOG.warning("validation loss is not available - reset model weights to last checkpoint")
@@ -1151,11 +1481,21 @@ def train(
                 )
                 has_exceeded_dp_max_epsilon = dp_total_epsilon > dp_max_epsilon if with_dp else False
                 if not has_exceeded_dp_max_epsilon:
+                    # Get the correct optimizer for checkpointing
+                    if with_dp and use_lookahead:
+                        checkpoint_optimizer = optimizer.optimizer  # DP optimizer
+                    elif with_dp:
+                        checkpoint_optimizer = optimizer  # DP optimizer
+                    elif use_lookahead:
+                        checkpoint_optimizer = optimizer.optimizer  # base AdamW
+                    else:
+                        checkpoint_optimizer = optimizer  # base AdamW
+                        
                     # save model weights with the best validation loss (and that hasn't exceeded DP max epsilon)
                     is_checkpoint = model_checkpoint.save_checkpoint_if_best(
                         val_loss=val_loss,
                         model=argn,
-                        optimizer=base_optimizer,
+                        optimizer=checkpoint_optimizer,
                         lr_scheduler=lr_scheduler,
                         dp_accountant=privacy_engine.accountant if with_dp else None,
                     )
@@ -1248,10 +1588,19 @@ def train(
         # no checkpoint is saved yet because the training stopped before the first epoch ended
         if not model_checkpoint.has_saved_once():
             _LOG.info("saving model weights, as none were saved so far")
-            base_optimizer = optimizer.optimizer if use_lookahead else optimizer
+            # Get the correct optimizer for checkpointing
+            if with_dp and use_lookahead:
+                checkpoint_optimizer = optimizer.optimizer  # DP optimizer
+            elif with_dp:
+                checkpoint_optimizer = optimizer  # DP optimizer
+            elif use_lookahead:
+                checkpoint_optimizer = optimizer.optimizer  # base AdamW
+            else:
+                checkpoint_optimizer = optimizer  # base AdamW
+                
             model_checkpoint.save_checkpoint(
                 model=argn,
-                optimizer=base_optimizer,
+                optimizer=checkpoint_optimizer,
                 lr_scheduler=lr_scheduler,
                 dp_accountant=privacy_engine.accountant if with_dp else None,
             )
@@ -1260,7 +1609,13 @@ def train(
                 val_loss = None
             else:
                 _LOG.info("calculate validation loss")
-                val_loss = _calculate_val_loss(model=argn, val_dataloader=val_dataloader, criterion=enhanced_criterion)
+                val_loss = _calculate_val_loss(
+                    model=argn, 
+                    val_dataloader=val_dataloader, 
+                    criterion=enhanced_criterion,
+                    use_mixed_precision=use_mixed_precision,
+                    mixed_precision_backend=mixed_precision_backend,
+                )
             dp_total_epsilon = (
                 privacy_engine.get_epsilon(dp_total_delta) + dp_value_protection_epsilon if with_dp else None
             )
