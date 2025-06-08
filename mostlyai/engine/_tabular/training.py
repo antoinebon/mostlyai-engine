@@ -16,40 +16,28 @@ import logging
 import math
 import time
 import warnings
-from collections.abc import Callable
-from importlib.metadata import version
 from itertools import zip_longest
 from pathlib import Path
+from collections.abc import Callable
+from typing import Any
 
+from importlib.metadata import version
 import numpy as np
 import pandas as pd
 import torch
-from datasets import disable_progress_bar, load_dataset
-from opacus import GradSampleModule, PrivacyEngine
-from opacus.accountants import GaussianAccountant, PRVAccountant, RDPAccountant
-from opacus.utils.batch_memory_manager import wrap_data_loader
-from torch import nn
-from torch.optim.lr_scheduler import LRScheduler
+from datasets import load_dataset, disable_progress_bar
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import LRScheduler
+import torch.nn.functional as F
 
-from mostlyai.engine._common import (
-    CTXFLT,
-    CTXSEQ,
-    SDEC_SUB_COLUMN_PREFIX,
-    SIDX_SUB_COLUMN_PREFIX,
-    SLEN_SUB_COLUMN_PREFIX,
-    TGT,
-    ProgressCallback,
-    ProgressCallbackWrapper,
-    get_cardinalities,
-    get_columns_from_cardinalities,
-    get_ctx_sequence_length,
-    get_max_data_points_per_sample,
-    get_sequence_length_stats,
-    get_sub_columns_from_cardinalities,
-    get_sub_columns_nested_from_cardinalities,
-)
+from torch import nn
+
+from opacus import PrivacyEngine, GradSampleModule
+from opacus.accountants import PRVAccountant, RDPAccountant, GaussianAccountant
+from opacus.utils.batch_memory_manager import wrap_data_loader
+
 from mostlyai.engine._memory import get_available_ram_for_heuristics
+from mostlyai.engine.domain import ModelStateStrategy, DifferentialPrivacyConfig
 from mostlyai.engine._tabular.argn import (
     FlatModel,
     ModelSize,
@@ -57,15 +45,31 @@ from mostlyai.engine._tabular.argn import (
     get_model_units,
     get_no_of_model_parameters,
 )
+from mostlyai.engine._common import (
+    CTXFLT,
+    CTXSEQ,
+    TGT,
+    get_cardinalities,
+    get_columns_from_cardinalities,
+    get_ctx_sequence_length,
+    get_max_data_points_per_sample,
+    get_sequence_length_stats,
+    get_sub_columns_from_cardinalities,
+    get_sub_columns_nested_from_cardinalities,
+    SIDX_SUB_COLUMN_PREFIX,
+    SLEN_SUB_COLUMN_PREFIX,
+    SDEC_SUB_COLUMN_PREFIX,
+    ProgressCallback,
+    ProgressCallbackWrapper,
+)
 from mostlyai.engine._tabular.common import load_model_weights
 from mostlyai.engine._training_utils import (
+    check_early_training_exit,
     EarlyStopper,
     ModelCheckpoint,
     ProgressMessage,
-    check_early_training_exit,
 )
 from mostlyai.engine._workspace import Workspace, ensure_workspace_dir
-from mostlyai.engine.domain import DifferentialPrivacyConfig, ModelStateStrategy
 
 _LOG = logging.getLogger(__name__)
 
@@ -126,6 +130,179 @@ def _learn_rate_heuristic(batch_size: int) -> float:
     return learn_rate
 
 
+#####################
+### ENHANCED LOSS ###
+#####################
+
+
+class FocalLoss(nn.Module):
+    """Focal Loss implementation for handling class imbalance."""
+    
+    def __init__(self, alpha: float = 1.0, gamma: float = 2.0, reduction: str = "mean"):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce_loss = F.cross_entropy(inputs, targets, reduction="none")
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        
+        if self.reduction == "mean":
+            return focal_loss.mean()
+        elif self.reduction == "sum":
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+class EnhancedLoss(nn.Module):
+    """Enhanced loss with focal loss and label smoothing options."""
+    
+    def __init__(
+        self, 
+        use_focal_loss: bool = False,
+        focal_alpha: float = 1.0,
+        focal_gamma: float = 2.0,
+        label_smoothing: float = 0.0,
+        reduction: str = "none"
+    ):
+        super().__init__()
+        self.use_focal_loss = use_focal_loss
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+        
+        if use_focal_loss:
+            self.criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction=reduction)
+        else:
+            self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing, reduction=reduction)
+    
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return self.criterion(inputs, targets)
+
+
+#########################
+### ADVANCED SCHEDULERS ###
+#########################
+
+
+class WarmupCosineScheduler(LRScheduler):
+    """Learning rate scheduler with warmup and cosine annealing."""
+    
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_epochs: int,
+        total_epochs: int,
+        min_lr_ratio: float = 0.01,
+        last_epoch: int = -1
+    ):
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.min_lr_ratio = min_lr_ratio
+        super().__init__(optimizer, last_epoch)
+    
+    def get_lr(self):
+        if self.last_epoch < self.warmup_epochs:
+            # Warmup phase
+            warmup_factor = (self.last_epoch + 1) / self.warmup_epochs
+            return [base_lr * warmup_factor for base_lr in self.base_lrs]
+        else:
+            # Cosine annealing phase
+            progress = (self.last_epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
+            cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
+            return [
+                base_lr * (self.min_lr_ratio + (1 - self.min_lr_ratio) * cosine_factor)
+                for base_lr in self.base_lrs
+            ]
+
+
+class CosineRestartScheduler(LRScheduler):
+    """Cosine annealing with warm restarts."""
+    
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        t_0: int,
+        t_mult: int = 2,
+        eta_min_ratio: float = 0.01,
+        last_epoch: int = -1
+    ):
+        self.t_0 = t_0
+        self.t_mult = t_mult
+        self.eta_min_ratio = eta_min_ratio
+        self.t_i = t_0
+        self.t_cur = 0
+        super().__init__(optimizer, last_epoch)
+    
+    def get_lr(self):
+        if self.t_cur == self.t_i:
+            self.t_cur = 0
+            self.t_i *= self.t_mult
+        
+        cosine_factor = 0.5 * (1 + math.cos(math.pi * self.t_cur / self.t_i))
+        self.t_cur += 1
+        
+        return [
+            base_lr * (self.eta_min_ratio + (1 - self.eta_min_ratio) * cosine_factor)
+            for base_lr in self.base_lrs
+        ]
+
+
+####################
+### LOOKAHEAD OPTIMIZER ###
+####################
+
+
+class Lookahead:
+    """Lookahead optimizer wrapper."""
+    
+    def __init__(self, optimizer: torch.optim.Optimizer, k: int = 5, alpha: float = 0.5):
+        self.optimizer = optimizer
+        self.k = k
+        self.alpha = alpha
+        self.step_count = 0
+        
+        self.slow_weights = []
+        for group in self.optimizer.param_groups:
+            group_dict = {}
+            for p in group['params']:
+                if p.requires_grad:
+                    group_dict[p] = p.data.clone()
+            self.slow_weights.append(group_dict)
+    
+    def step(self, closure=None):
+        loss = self.optimizer.step(closure)
+        self.step_count += 1
+        
+        if self.step_count % self.k == 0:
+            for group, slow_group in zip(self.optimizer.param_groups, self.slow_weights):
+                for p in group['params']:
+                    if p.requires_grad and p in slow_group:
+                        slow_group[p].data.add_(p.data - slow_group[p].data, alpha=self.alpha)
+                        p.data.copy_(slow_group[p].data)
+        
+        return loss
+    
+    def zero_grad(self, set_to_none: bool = False):
+        self.optimizer.zero_grad(set_to_none)
+    
+    @property
+    def param_groups(self):
+        return self.optimizer.param_groups
+    
+    @property
+    def state(self):
+        return self.optimizer.state
+    
+    def state_dict(self):
+        return self.optimizer.state_dict()
+    
+    def load_state_dict(self, state_dict):
+        self.optimizer.load_state_dict(state_dict)
+
+
 ####################
 ### DATA LOADERS ###
 ####################
@@ -133,20 +310,31 @@ def _learn_rate_heuristic(batch_size: int) -> float:
 
 class BatchCollator:
     """
-    Collate a batch of samples into a dictionary of tensors.
-    For sequence data, it will sample subsequences with lengths up to max_sequence_window.
+    Enhanced collate function with adaptive sequence sampling.
+    For sequence data, it will sample subsequences with advanced strategies.
     """
 
-    def __init__(self, is_sequential: bool, max_sequence_window: int | None, device: torch.device):
+    def __init__(
+        self, 
+        is_sequential: bool, 
+        max_sequence_window: int | None, 
+        device: torch.device,
+        adaptive_sampling: bool = False,
+        difficulty_progression: float = 0.0
+    ):
         self.is_sequential = is_sequential
         self.max_sequence_window = max_sequence_window
         self.device = device
+        self.adaptive_sampling = adaptive_sampling
+        self.difficulty_progression = difficulty_progression
+        self.step_count = 0
 
     def __call__(self, batch: list[dict]) -> dict[str, torch.Tensor]:
         batch = pd.DataFrame(batch)
         if self.is_sequential and self.max_sequence_window:
-            batch = self._slice_sequences(batch, self.max_sequence_window)
+            batch = self._slice_sequences_enhanced(batch, self.max_sequence_window)
         batch = self._convert_to_tensors(batch)
+        self.step_count += 1
         return batch
 
     def _convert_to_tensors(self, batch: pd.DataFrame) -> dict[str, torch.Tensor]:
@@ -187,33 +375,79 @@ class BatchCollator:
                 )
         return tensors
 
-    @staticmethod
-    def _slice_sequences(batch: pd.DataFrame, max_sequence_window: int) -> pd.DataFrame:
+    def _slice_sequences_enhanced(self, batch: pd.DataFrame, max_sequence_window: int) -> pd.DataFrame:
+        """Enhanced sequence slicing with adaptive strategies."""
         # determine sequence lengths of current batch
         tgt_columns = [col for col in batch.columns if col.startswith(TGT)]
         seq_lens = batch[tgt_columns[0]].copy().str.len().values
 
-        # determine sampling logic for current batch
-        flip = np.random.random()
-        if flip < 0.3:  # 30%
-            # pick start of the sequence to focus on the beginning
-            sel_idxs = [np.arange(0, min(max_sequence_window, seq_len)) for seq_len in seq_lens]
-        elif 0.3 <= flip < 0.4:  # 10%
-            # pick end of the sequence to focus on the end
-            sel_idxs = [np.arange(max(0, seq_len - max_sequence_window), seq_len) for seq_len in seq_lens]
-        else:  # 60%
-            # random continuous window to focus on any part
-            start_idxs = np.random.randint(low=1 - max_sequence_window, high=seq_lens, size=len(seq_lens))
-            # ensure that sequences that fit into max_sequence_length are completely covered
-            start_idxs[seq_lens <= max_sequence_window] = 0
-            # calculate final start and end indexes
-            end_idxs = start_idxs + max_sequence_window
-            start_idxs = np.maximum(0, start_idxs)
-            sel_idxs = [
-                np.arange(start, min(seq_len, end)) for start, end, seq_len in zip(start_idxs, end_idxs, seq_lens)
-            ]
+        if self.adaptive_sampling:
+            # Adaptive sampling based on difficulty progression
+            difficulty_factor = min(1.0, self.difficulty_progression * self.step_count / 1000.0)
+            
+            # Gradually shift from easier (start/end) to harder (random) sampling
+            if difficulty_factor < 0.3:
+                # Early training: focus on start and end
+                flip = np.random.random()
+                if flip < 0.5:
+                    sampling_strategy = "start"
+                else:
+                    sampling_strategy = "end"
+            elif difficulty_factor < 0.7:
+                # Mid training: mix of strategies
+                flip = np.random.random()
+                if flip < 0.2:
+                    sampling_strategy = "start"
+                elif flip < 0.4:
+                    sampling_strategy = "end"
+                else:
+                    sampling_strategy = "random"
+            else:
+                # Late training: more challenging random sampling
+                sampling_strategy = "random"
+        else:
+            # Original sampling logic
+            flip = np.random.random()
+            if flip < 0.3:
+                sampling_strategy = "start"
+            elif flip < 0.4:
+                sampling_strategy = "end"
+            else:
+                sampling_strategy = "random"
 
-        # loop over each record within batch and pick values for each tgt column
+        # Apply sampling strategy
+        if sampling_strategy == "start":
+            sel_idxs = [np.arange(0, min(max_sequence_window, seq_len)) for seq_len in seq_lens]
+        elif sampling_strategy == "end":
+            sel_idxs = [np.arange(max(0, seq_len - max_sequence_window), seq_len) for seq_len in seq_lens]
+        else:  # random
+            # Content-aware windowing: adjust window size based on sequence complexity
+            if self.adaptive_sampling:
+                # Vary window size based on sequence length for better coverage
+                adjusted_windows = []
+                for seq_len in seq_lens:
+                    if seq_len <= max_sequence_window:
+                        adjusted_windows.append(seq_len)
+                    else:
+                        # Use slightly varied window sizes for diversity
+                        variance = max(1, max_sequence_window // 10)
+                        adjusted_window = max_sequence_window + np.random.randint(-variance, variance + 1)
+                        adjusted_window = max(1, min(adjusted_window, seq_len))
+                        adjusted_windows.append(adjusted_window)
+            else:
+                adjusted_windows = [max_sequence_window] * len(seq_lens)
+            
+            start_idxs = []
+            sel_idxs = []
+            for seq_len, window_size in zip(seq_lens, adjusted_windows):
+                if seq_len <= window_size:
+                    start_idx = 0
+                else:
+                    start_idx = np.random.randint(0, seq_len - window_size + 1)
+                start_idxs.append(start_idx)
+                sel_idxs.append(np.arange(start_idx, start_idx + window_size))
+
+        # Apply selection to batch
         tgt_col_idxs = [batch.columns.get_loc(c) for c in tgt_columns]
         rows = []
         for row_idx, batch_row in enumerate(batch.itertuples(index=False)):
@@ -249,12 +483,13 @@ class TabularModelCheckpoint(ModelCheckpoint):
 
 
 def _calculate_sample_losses(
-    model: FlatModel | SequentialModel | GradSampleModule, data: dict[str, torch.Tensor]
+    model: FlatModel | SequentialModel | GradSampleModule, 
+    data: dict[str, torch.Tensor],
+    criterion: EnhancedLoss
 ) -> torch.Tensor:
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning, message="Using a non-full backward hook*")
         output, _ = model(data, mode="trn")
-    criterion = nn.CrossEntropyLoss(reduction="none")
 
     tgt_cols = (
         list(model.tgt_cardinalities.keys())
@@ -305,11 +540,12 @@ def _calculate_sample_losses(
 def _calculate_val_loss(
     model: FlatModel | SequentialModel,
     val_dataloader: DataLoader,
+    criterion: EnhancedLoss,
 ) -> float:
     val_sample_losses: list[torch.Tensor] = []
     model.eval()
     for step_data in val_dataloader:
-        step_losses = _calculate_sample_losses(model, step_data)
+        step_losses = _calculate_sample_losses(model, step_data, criterion)
         val_sample_losses.extend(step_losses.detach())
     model.train()
     val_sample_losses: torch.Tensor = torch.stack(val_sample_losses, dim=0)
@@ -347,8 +583,85 @@ def train(
     device: torch.device | str | None = None,
     workspace_dir: str | Path = "engine-ws",
     update_progress: ProgressCallback | None = None,
+    # Learning Rate Enhancements
+    use_warmup_cosine: bool = True,
+    warmup_epochs: int = 5,
+    min_lr_ratio: float = 0.01,
+    use_cosine_restarts: bool = False,
+    restart_period: int = 20,
+    restart_mult: int = 2,
+    # Advanced Regularization
+    gradient_clip_norm: float | None = 1.0,
+    weight_decay_schedule: bool = True,
+    initial_weight_decay: float = 0.01,
+    final_weight_decay: float = 0.001,
+    # Loss Function Enhancements
+    use_focal_loss: bool = False,
+    focal_alpha: float = 1.0,
+    focal_gamma: float = 2.0,
+    label_smoothing: float = 0.0,
+    # Sequence Sampling Enhancements
+    adaptive_sampling: bool = True,
+    difficulty_progression: float = 0.001,
+    # Optimizer Enhancements
+    use_lookahead: bool = False,
+    lookahead_k: int = 5,
+    lookahead_alpha: float = 0.5,
+    adaptive_betas: bool = True,
+    beta1_schedule: tuple[float, float] = (0.9, 0.95),
+    beta2_schedule: tuple[float, float] = (0.999, 0.99),
 ):
-    _LOG.info("TRAIN_TABULAR started")
+    """Enhanced training function with advanced optimization techniques.
+    
+    Args:
+        # Original parameters (unchanged)
+        model: Model size ("MOSTLY_AI/Small", "MOSTLY_AI/Medium", "MOSTLY_AI/Large")
+        max_training_time: Maximum training time in hours
+        max_epochs: Maximum number of epochs
+        batch_size: Batch size (auto-determined if None)
+        gradient_accumulation_steps: Gradient accumulation steps
+        max_sequence_window: Maximum sequence window for sequential data
+        enable_flexible_generation: Enable flexible column ordering
+        differential_privacy: Differential privacy configuration
+        upload_model_data_callback: Callback for uploading model data
+        model_state_strategy: Strategy for handling existing model state
+        device: Device to use for training
+        workspace_dir: Workspace directory path
+        update_progress: Progress callback function
+        
+        # Learning Rate Enhancements
+        use_warmup_cosine: Use warmup + cosine annealing scheduler
+        warmup_epochs: Number of warmup epochs
+        min_lr_ratio: Minimum learning rate as ratio of initial LR
+        use_cosine_restarts: Use cosine annealing with warm restarts
+        restart_period: Initial restart period
+        restart_mult: Restart period multiplier
+        
+        # Advanced Regularization
+        gradient_clip_norm: Gradient clipping norm (None to disable)
+        weight_decay_schedule: Use scheduled weight decay
+        initial_weight_decay: Initial weight decay value
+        final_weight_decay: Final weight decay value
+        
+        # Loss Function Enhancements
+        use_focal_loss: Use focal loss instead of CrossEntropy
+        focal_alpha: Focal loss alpha parameter
+        focal_gamma: Focal loss gamma parameter
+        label_smoothing: Label smoothing factor
+        
+        # Sequence Sampling Enhancements
+        adaptive_sampling: Use adaptive sequence sampling
+        difficulty_progression: Rate of difficulty progression
+        
+        # Optimizer Enhancements
+        use_lookahead: Wrap optimizer with Lookahead
+        lookahead_k: Lookahead k parameter
+        lookahead_alpha: Lookahead alpha parameter
+        adaptive_betas: Use adaptive beta scheduling
+        beta1_schedule: (initial_beta1, final_beta1) for adaptive scheduling
+        beta2_schedule: (initial_beta2, final_beta2) for adaptive scheduling
+    """
+    _LOG.info("ENHANCED_TRAIN_TABULAR started")
     t0 = time.time()
     workspace_dir = ensure_workspace_dir(workspace_dir)
     workspace = Workspace(workspace_dir)
@@ -364,6 +677,14 @@ def train(
         )
         _LOG.info(f"{device=}")
         torch.set_default_dtype(torch.float32)
+
+        # Log enhancement settings
+        _LOG.info("=== ENHANCEMENT SETTINGS ===")
+        _LOG.info(f"Learning Rate: warmup_cosine={use_warmup_cosine}, cosine_restarts={use_cosine_restarts}")
+        _LOG.info(f"Regularization: gradient_clip={gradient_clip_norm}, weight_decay_schedule={weight_decay_schedule}")
+        _LOG.info(f"Loss: focal_loss={use_focal_loss}, label_smoothing={label_smoothing}")
+        _LOG.info(f"Sampling: adaptive={adaptive_sampling}, difficulty_progression={difficulty_progression}")
+        _LOG.info(f"Optimizer: lookahead={use_lookahead}, adaptive_betas={adaptive_betas}")
 
         has_context = workspace.ctx_stats.path.exists()
         tgt_stats = workspace.tgt_stats.read()
@@ -502,7 +823,7 @@ def train(
             "model_units": model_units,
             "enable_flexible_generation": enable_flexible_generation,
         }
-        workspace.model_configs.write(model_configs)
+        workspace.model_tabular_configs.write(model_configs)
 
         # heuristics for batch_size and for initial learn_rate
         mem_available_gb = get_available_ram_for_heuristics() / 1024**3
@@ -535,9 +856,13 @@ def train(
             # which speeds up compute, plus it results in a more stable val_loss
             val_batch_size = val_batch_size // 2
 
-        # and see if it's possible to make it compatible with DP
+        # Enhanced batch collator with adaptive sampling
         batch_collator = BatchCollator(
-            is_sequential=is_sequential, max_sequence_window=max_sequence_window, device=device
+            is_sequential=is_sequential, 
+            max_sequence_window=max_sequence_window, 
+            device=device,
+            adaptive_sampling=adaptive_sampling,
+            difficulty_progression=difficulty_progression
         )
         disable_progress_bar()
         trn_dataset = load_dataset("parquet", data_files=[str(p) for p in workspace.encoded_data_trn.fetch_all()])[
@@ -584,15 +909,64 @@ def train(
         _LOG.info(f"{trn_steps=}, {val_steps=}")
         _LOG.info(f"{batch_size=}, {gradient_accumulation_steps=}, {initial_lr=}")
 
-        early_stopper = EarlyStopper(val_loss_patience=4)
-        optimizer = torch.optim.AdamW(params=argn.parameters(), lr=initial_lr)
-        lr_scheduler: LRScheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer=optimizer,
-            factor=0.5,
-            patience=2,
-            min_lr=0.1 * initial_lr,
-            # threshold=0,  # if we prefer to completely mimic the behavior of previous implementation
+        # Enhanced loss function
+        enhanced_criterion = EnhancedLoss(
+            use_focal_loss=use_focal_loss,
+            focal_alpha=focal_alpha,
+            focal_gamma=focal_gamma,
+            label_smoothing=label_smoothing,
+            reduction="none"
         )
+        _LOG.info(f"Loss function: focal={use_focal_loss}, smoothing={label_smoothing}")
+
+        early_stopper = EarlyStopper(val_loss_patience=4)
+        
+        # Enhanced optimizer with adaptive betas and weight decay
+        current_weight_decay = initial_weight_decay
+        if adaptive_betas:
+            current_beta1, current_beta2 = beta1_schedule[0], beta2_schedule[0]
+        else:
+            current_beta1, current_beta2 = 0.9, 0.999
+            
+        optimizer = torch.optim.AdamW(
+            params=argn.parameters(), 
+            lr=initial_lr,
+            betas=(current_beta1, current_beta2),
+            weight_decay=current_weight_decay
+        )
+        
+        # Wrap with Lookahead if enabled
+        if use_lookahead:
+            optimizer = Lookahead(optimizer, k=lookahead_k, alpha=lookahead_alpha)
+            _LOG.info(f"Lookahead optimizer enabled: k={lookahead_k}, alpha={lookahead_alpha}")
+
+        # Enhanced learning rate scheduler
+        if use_cosine_restarts:
+            lr_scheduler = CosineRestartScheduler(
+                optimizer=optimizer.optimizer if use_lookahead else optimizer,
+                t_0=restart_period,
+                t_mult=restart_mult,
+                eta_min_ratio=min_lr_ratio
+            )
+            _LOG.info(f"Cosine restart scheduler: period={restart_period}, mult={restart_mult}")
+        elif use_warmup_cosine:
+            total_steps = int(max_epochs * trn_steps)
+            warmup_steps = int(warmup_epochs * trn_steps)
+            lr_scheduler = WarmupCosineScheduler(
+                optimizer=optimizer.optimizer if use_lookahead else optimizer,
+                warmup_epochs=warmup_steps,
+                total_epochs=total_steps,
+                min_lr_ratio=min_lr_ratio
+            )
+            _LOG.info(f"Warmup cosine scheduler: warmup={warmup_epochs}, min_ratio={min_lr_ratio}")
+        else:
+            lr_scheduler: LRScheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer=optimizer.optimizer if use_lookahead else optimizer,
+                factor=0.5,
+                patience=2,
+                min_lr=0.1 * initial_lr,
+            )
+            
         if (
             model_state_strategy == ModelStateStrategy.resume
             and model_checkpoint.optimizer_and_lr_scheduler_paths_exist()
@@ -600,7 +974,8 @@ def train(
             # restore the full states of optimizer and lr_scheduler when possible
             # otherwise, only the learning rate from the last progress message will be restored
             _LOG.info("restore optimizer and LR scheduler states")
-            optimizer.load_state_dict(
+            base_optimizer = optimizer.optimizer if use_lookahead else optimizer
+            base_optimizer.load_state_dict(
                 torch.load(workspace.model_optimizer_path, map_location=device, weights_only=True)
             )
             lr_scheduler.load_state_dict(
@@ -637,18 +1012,23 @@ def train(
             # - model: wrapped in GradSampleModule and contains additional hooks for computing per-sample gradients
             # - optimizer: wrapped in DPOptimizer and will do different operations during virtual steps and logical steps
             # - dataloader: the dataloader with batch_sampler=UniformWithReplacementSampler (for Poisson sampling)
-            argn, optimizer, trn_dataloader = privacy_engine.make_private(
+            base_optimizer = optimizer.optimizer if use_lookahead else optimizer
+            argn, base_optimizer, trn_dataloader = privacy_engine.make_private(
                 module=argn,
-                optimizer=optimizer,
+                optimizer=base_optimizer,
                 data_loader=trn_dataloader,
                 noise_multiplier=dp_config.get("noise_multiplier"),
                 max_grad_norm=dp_config.get("max_grad_norm"),
                 poisson_sampling=True,
             )
+            if use_lookahead:
+                optimizer.optimizer = base_optimizer
+            else:
+                optimizer = base_optimizer
             # this further wraps the dataloader with batch_sampler=BatchSplittingSampler to achieve gradient accumulation
             # it will split the sampled logical batches into smaller sub-batches with batch_size
             trn_dataloader = wrap_data_loader(
-                data_loader=trn_dataloader, max_batch_size=batch_size, optimizer=optimizer
+                data_loader=trn_dataloader, max_batch_size=batch_size, optimizer=base_optimizer
             )
         else:
             privacy_engine = None
@@ -661,12 +1041,35 @@ def train(
         trn_sample_losses: list[torch.Tensor] = []
         do_stop = False
         current_lr = initial_lr
+        total_steps = int(max_epochs * trn_steps)
+        
+        # Gradient norm tracking for monitoring
+        gradient_norms = []
+        
         # infinite loop over training steps, until we decide to stop
         # either because of max_epochs, max_training_time or early_stopping
         while not do_stop:
             is_checkpoint = 0
             steps += 1
             epoch = steps / trn_steps
+
+            # Update adaptive parameters based on progress
+            progress_ratio = min(1.0, steps / total_steps) if total_steps > 0 else 0.0
+            
+            # Update weight decay if scheduled
+            if weight_decay_schedule:
+                current_weight_decay = initial_weight_decay + (final_weight_decay - initial_weight_decay) * progress_ratio
+                base_optimizer = optimizer.optimizer if use_lookahead else optimizer
+                for param_group in base_optimizer.param_groups:
+                    param_group['weight_decay'] = current_weight_decay
+            
+            # Update adaptive betas if enabled
+            if adaptive_betas:
+                new_beta1 = beta1_schedule[0] + (beta1_schedule[1] - beta1_schedule[0]) * progress_ratio
+                new_beta2 = beta2_schedule[0] + (beta2_schedule[1] - beta2_schedule[0]) * progress_ratio
+                base_optimizer = optimizer.optimizer if use_lookahead else optimizer
+                for param_group in base_optimizer.param_groups:
+                    param_group['betas'] = (new_beta1, new_beta2)
 
             stop_accumulating_grads = False
             accumulated_steps = 0
@@ -680,7 +1083,7 @@ def train(
                     trn_data_iter = iter(trn_dataloader)
                     step_data = next(trn_data_iter)
                 # forward pass + calculate sample losses
-                step_losses = _calculate_sample_losses(argn, step_data)
+                step_losses = _calculate_sample_losses(argn, step_data, enhanced_criterion)
                 # FIXME in sequential case, this is an approximation, it should be divided by total sum of masks in the
                 #  entire batch to get the average loss per sample. Less importantly the final sample may be smaller
                 #  than the batch size in both flat and sequential case.
@@ -693,6 +1096,17 @@ def train(
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=FutureWarning, message="Using a non-full backward hook*")
                     step_loss.backward()
+                
+                # Enhanced gradient clipping (even for non-DP training)
+                if gradient_clip_norm is not None and not with_dp:
+                    total_norm = torch.nn.utils.clip_grad_norm_(argn.parameters(), gradient_clip_norm)
+                    gradient_norms.append(total_norm.item())
+                    
+                    # Log gradient norms periodically
+                    if len(gradient_norms) % 100 == 0:
+                        avg_norm = np.mean(gradient_norms[-100:])
+                        _LOG.debug(f"Average gradient norm (last 100 steps): {avg_norm:.4f}")
+                
                 accumulated_steps += 1
                 # explicitly count the number of processed samples as the actual batch size can vary when DP is on
                 samples += step_losses.shape[0]
@@ -711,11 +1125,10 @@ def train(
                 step_losses = step_losses.detach()
                 trn_sample_losses.extend(step_losses)
 
-            current_lr = optimizer.param_groups[0][
-                "lr"
-            ]  # currently assume that we have the same lr for all param groups
+            base_optimizer = optimizer.optimizer if use_lookahead else optimizer
+            current_lr = base_optimizer.param_groups[0]["lr"]  # currently assume that we have the same lr for all param groups
 
-            # only the scheduling for ReduceLROnPlateau is postponed until the metric becomes available
+            # Enhanced learning rate scheduling
             if not isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 lr_scheduler.step()
 
@@ -723,7 +1136,7 @@ def train(
             do_validation = on_epoch_end = epoch.is_integer()
             if do_validation:
                 # calculate val loss and trn loss
-                val_loss = _calculate_val_loss(model=argn, val_dataloader=val_dataloader)
+                val_loss = _calculate_val_loss(model=argn, val_dataloader=val_dataloader, criterion=enhanced_criterion)
                 # handle scenario where model training ran into numeric instability
                 if pd.isna(val_loss):
                     _LOG.warning("validation loss is not available - reset model weights to last checkpoint")
@@ -742,12 +1155,18 @@ def train(
                     is_checkpoint = model_checkpoint.save_checkpoint_if_best(
                         val_loss=val_loss,
                         model=argn,
-                        optimizer=optimizer,
+                        optimizer=base_optimizer,
                         lr_scheduler=lr_scheduler,
                         dp_accountant=privacy_engine.accountant if with_dp else None,
                     )
                 else:
                     _LOG.info("early stopping: current DP epsilon has exceeded max epsilon")
+                    
+                # Log enhanced metrics
+                if gradient_norms:
+                    avg_grad_norm = np.mean(gradient_norms[-100:]) if len(gradient_norms) >= 100 else np.mean(gradient_norms)
+                    _LOG.info(f"Avg gradient norm: {avg_grad_norm:.4f}, Weight decay: {current_weight_decay:.6f}")
+                    
                 # gather message for progress with checkpoint info
                 progress_message = ProgressMessage(
                     epoch=epoch,
@@ -829,9 +1248,10 @@ def train(
         # no checkpoint is saved yet because the training stopped before the first epoch ended
         if not model_checkpoint.has_saved_once():
             _LOG.info("saving model weights, as none were saved so far")
+            base_optimizer = optimizer.optimizer if use_lookahead else optimizer
             model_checkpoint.save_checkpoint(
                 model=argn,
-                optimizer=optimizer,
+                optimizer=base_optimizer,
                 lr_scheduler=lr_scheduler,
                 dp_accountant=privacy_engine.accountant if with_dp else None,
             )
@@ -840,7 +1260,7 @@ def train(
                 val_loss = None
             else:
                 _LOG.info("calculate validation loss")
-                val_loss = _calculate_val_loss(model=argn, val_dataloader=val_dataloader)
+                val_loss = _calculate_val_loss(model=argn, val_dataloader=val_dataloader, criterion=enhanced_criterion)
             dp_total_epsilon = (
                 privacy_engine.get_epsilon(dp_total_delta) + dp_value_protection_epsilon if with_dp else None
             )
@@ -861,4 +1281,14 @@ def train(
             progress.update(completed=steps, total=steps, message=progress_message)
             # ensure everything gets uploaded
             upload_model_data_callback()
-    _LOG.info(f"TRAIN_TABULAR finished in {time.time() - t0:.2f}s")
+            
+        # Log final enhancement statistics
+        if gradient_norms:
+            _LOG.info(f"Final gradient statistics: mean={np.mean(gradient_norms):.4f}, std={np.std(gradient_norms):.4f}")
+        _LOG.info(f"Final weight decay: {current_weight_decay:.6f}")
+        if adaptive_betas:
+            base_optimizer = optimizer.optimizer if use_lookahead else optimizer
+            final_betas = base_optimizer.param_groups[0]['betas']
+            _LOG.info(f"Final betas: {final_betas}")
+            
+    _LOG.info(f"ENHANCED_TRAIN_TABULAR finished in {time.time() - t0:.2f}s")
