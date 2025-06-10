@@ -38,6 +38,7 @@ def train(
     workspace_dir: str | Path = "engine-ws",
     update_progress: ProgressCallback | None = None,
     upload_model_data_callback: Callable | None = None,
+    **kwargs,
 ) -> None:
     """
     Trains a model with optional early stopping and differential privacy.
@@ -80,6 +81,7 @@ def train(
             model_state_strategy=model_state_strategy,
             device=device,
             max_sequence_window=max_sequence_window if max_sequence_window else args["max_sequence_window"].default,
+            **kwargs,
         )
     else:
         from mostlyai.engine._language.training import train as train_language
@@ -101,4 +103,5 @@ def train(
             upload_model_data_callback=upload_model_data_callback,
             model_state_strategy=model_state_strategy,
             device=device,
+            **kwargs,
         )

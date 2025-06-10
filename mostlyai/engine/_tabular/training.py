@@ -289,8 +289,8 @@ class AdaptiveBatchSizeManager:
             )
         
         # Round to nearest power of 2 for efficiency
-        new_batch_size = 2 ** round(np.log2(new_batch_size))
-        new_batch_size = np.clip(new_batch_size, self.min_batch_size, self.max_batch_size)
+        # new_batch_size = 2 ** round(np.log2(new_batch_size))
+        new_batch_size = int(np.clip(new_batch_size, self.min_batch_size, self.max_batch_size))
         
         if new_batch_size != self.current_batch_size:
             self.current_batch_size = new_batch_size
@@ -769,14 +769,14 @@ def train(
     workspace_dir: str | Path = "engine-ws",
     update_progress: ProgressCallback | None = None,
     # Learning Rate Enhancements
-    use_warmup_cosine: bool = True,
+    use_warmup_cosine: bool = False,
     warmup_epochs: int = 5,
     min_lr_ratio: float = 0.01,
     use_cosine_restarts: bool = False,
     restart_period: int = 20,
     restart_mult: int = 2,
     # Advanced Regularization
-    gradient_clip_norm: float | None = 1.0,
+    gradient_clip_norm: float | None = None,
     weight_decay_schedule: bool = True,
     initial_weight_decay: float = 0.01,
     final_weight_decay: float = 0.001,
@@ -784,9 +784,9 @@ def train(
     use_focal_loss: bool = False,
     focal_alpha: float = 1.0,
     focal_gamma: float = 2.0,
-    label_smoothing: float = 0.0,
+    label_smoothing: float = 0.,
     # Sequence Sampling Enhancements
-    adaptive_sampling: bool = True,
+    adaptive_sampling: bool = False,
     difficulty_progression: float = 0.001,
     # Optimizer Enhancements
     use_lookahead: bool = False,
@@ -808,6 +808,9 @@ def train(
     use_mixed_precision: bool = False,
     mixed_precision_backend: str | None = None,
     mixed_precision_opt_level: str = "O1",
+    # Learning rate
+    initial_lr: float | None = None,
+    **kwargs,
 ):
     """Enhanced training function with advanced optimization techniques.
     
@@ -1005,7 +1008,6 @@ def train(
             epoch = 0.0
             steps = 0
             samples = 0
-            initial_lr = None
             total_time_init = 0.0
             progress.reset_progress_messages()
         _LOG.info(f"start training progress from {epoch=}, {steps=}")
@@ -1141,7 +1143,7 @@ def train(
         )
         _LOG.info(f"Loss function: focal={use_focal_loss}, smoothing={label_smoothing}")
 
-        early_stopper = EarlyStopper(val_loss_patience=4)
+        early_stopper = EarlyStopper(val_loss_patience=10)
         
         # Enhanced optimizer with adaptive betas and weight decay
         current_weight_decay = initial_weight_decay
@@ -1452,9 +1454,15 @@ def train(
                 new_batch_size, adaptation_reason = batch_size_manager.adapt_batch_size(steps)
                 if new_batch_size != current_batch_size:
                     _LOG.info(f"Batch size adaptation suggested: {current_batch_size} -> {new_batch_size} ({adaptation_reason})")
-                    # Note: In a full implementation, we would recreate the dataloader here
-                    # For now, we just log the recommendation
                     current_batch_size = new_batch_size
+                    trn_dataloader = DataLoader(
+                        dataset=trn_dataset,
+                        shuffle=True,
+                        # either DP logical batch size or grad accumulation physical batch size
+                        batch_size=current_batch_size,
+                        collate_fn=batch_collator,
+                    )
+                    trn_data_iter = iter(trn_dataloader)
 
             # do validation
             do_validation = on_epoch_end = epoch.is_integer()
@@ -1647,3 +1655,4 @@ def train(
             _LOG.info(f"Final betas: {final_betas}")
             
     _LOG.info(f"ENHANCED_TRAIN_TABULAR finished in {time.time() - t0:.2f}s")
+
