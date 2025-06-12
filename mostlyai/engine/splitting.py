@@ -73,7 +73,7 @@ def split(
     tgt_encoding_types: dict[str, str | ModelEncodingType] | None = None,
     ctx_encoding_types: dict[str, str | ModelEncodingType] | None = None,
     n_partitions: int = 1,
-    trn_val_split: float = 0.8,
+    trn_val_split: float = 0.9,
     workspace_dir: str | Path = "engine-ws",
     update_progress: ProgressCallback | None = None,
 ) -> None:
@@ -103,6 +103,7 @@ def split(
         workspace_dir: Path to the workspace directory where files will be created.
         update_progress: A custom progress callback.
     """
+    breakpoint()
     _LOG.info("SPLIT started")
     t0 = time.time()
     with ProgressCallbackWrapper(update_progress) as progress:
