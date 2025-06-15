@@ -39,7 +39,6 @@ from opacus.utils.batch_memory_manager import wrap_data_loader
 
 from mostlyai.engine._memory import get_available_ram_for_heuristics
 from mostlyai.engine.domain import ModelStateStrategy, DifferentialPrivacyConfig
-from mostlyai.engine._tabular.enhanced_argn import EnhancedFlatModel
 from mostlyai.engine._tabular.argn import (
     FlatModel,
     ModelSize,
@@ -160,6 +159,104 @@ class EMAModel:
         self._backup.clear()
 
 
+#################################
+### LEARNING RATE SCHEDULERS ###
+#################################
+
+
+class WarmupCosineScheduler(LRScheduler):
+    """Learning rate scheduler with warmup and cosine annealing."""
+    
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_steps: int,
+        total_steps: int,
+        min_lr_ratio: float = 0.01,
+        last_epoch: int = -1
+    ):
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr_ratio = min_lr_ratio
+        super().__init__(optimizer, last_epoch)
+    
+    def get_lr(self) -> list[float]:
+        if self.last_epoch < self.warmup_steps:
+            # Warmup phase
+            warmup_factor = (self.last_epoch + 1) / self.warmup_steps
+            return [base_lr * warmup_factor for base_lr in self.base_lrs]
+        else:
+            # Cosine annealing phase
+            progress = (self.last_epoch - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+            cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
+            return [
+                base_lr * (self.min_lr_ratio + (1 - self.min_lr_ratio) * cosine_factor)
+                for base_lr in self.base_lrs
+            ]
+
+
+class AdaptiveCosineScheduler(LRScheduler):
+    """Cosine scheduler that adapts based on validation loss plateaus."""
+    
+    def __init__(
+        self, 
+        optimizer: torch.optim.Optimizer,
+        total_steps: int,
+        warmup_steps: int,
+        learning_rate: float,
+        min_lr_ratio: float = 0.01,
+        patience: int = 5,
+        factor: float = 0.5,
+        last_epoch: int = -1
+    ):
+        self.total_steps = total_steps
+        self.warmup_steps = warmup_steps
+        self.base_learning_rate = learning_rate
+        self.min_lr_ratio = min_lr_ratio
+        
+        # Plateau detection
+        self.patience = patience
+        self.factor = factor
+        self.best_val_loss = float('inf')
+        self.patience_counter = 0
+        self.reduction_factor = 1.0
+        
+        super().__init__(optimizer, last_epoch)
+    
+    def get_lr(self) -> list[float]:
+        # Calculate base cosine LR
+        if self.last_epoch < self.warmup_steps:
+            # Warmup
+            warmup_factor = (self.last_epoch + 1) / self.warmup_steps
+            base_factor = warmup_factor
+        else:
+            # Cosine annealing
+            progress = (self.last_epoch - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+            cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
+            base_factor = self.min_lr_ratio + (1 - self.min_lr_ratio) * cosine_factor
+        
+        # Apply adaptive reduction
+        final_lr = self.base_learning_rate * base_factor * self.reduction_factor
+        return [final_lr for _ in self.base_lrs]
+    
+    def step_with_val_loss(self, val_loss: float) -> None:
+        """Step scheduler with validation loss for adaptive behavior."""
+        # Regular step
+        self.step()
+        
+        # Check for plateau
+        if val_loss < self.best_val_loss - 1e-4:
+            self.best_val_loss = val_loss
+            self.patience_counter = 0
+        else:
+            self.patience_counter += 1
+            
+        # Apply additional reduction if plateau detected
+        if self.patience_counter >= self.patience:
+            old_factor = self.reduction_factor
+            self.reduction_factor *= self.factor
+            self.patience_counter = 0
+            _LOG.info(f"Adaptive LR reduction: {old_factor:.4f} -> {self.reduction_factor:.4f}")
 
 
 ######################
@@ -271,24 +368,23 @@ class SimpleBatchCollator:
 
 
 #########################
-### ENHANCED EARLY STOPPING ###
+### EARLY STOPPING ###
 #########################
 
 
 @dataclass
-class EnhancedEarlyStopperConfig:
-    """Configuration for enhanced early stopping."""
+class EarlyStopperConfig:
+    """Configuration for early stopping."""
     patience: int = 10
     min_delta: float = 1e-4
-    restore_best_weights: bool = True
     monitor_train_loss: bool = True
     divergence_threshold: float = 2.0
 
 
-class EnhancedEarlyStopper:
-    """Enhanced early stopping with multiple criteria."""
+class ImprovedEarlyStopper:
+    """Early stopping with multiple criteria."""
     
-    def __init__(self, config: EnhancedEarlyStopperConfig):
+    def __init__(self, config: EarlyStopperConfig):
         self._config = config
         self._best_val_loss = float('inf')
         self._patience_counter = 0
@@ -337,11 +433,10 @@ class EnhancedEarlyStopper:
 
 
 class TabularModelCheckpoint(ModelCheckpoint):
-    """Enhanced model checkpoint with EMA support."""
+    """Model checkpoint with EMA support."""
     
-    def __init__(self, workspace: Workspace, save_ema: bool = True):
+    def __init__(self, workspace: Workspace):
         super().__init__(workspace)
-        self._save_ema = save_ema
     
     def _save_model_weights(self, model: torch.nn.Module) -> None:
         if isinstance(model, GradSampleModule):
@@ -367,7 +462,7 @@ def _calculate_sample_losses(
     focal_gamma: float = 2.0,
     label_smoothing: float = 0.0,
 ) -> torch.Tensor:
-    """Calculate per-sample losses with enhanced loss functions."""
+    """Calculate per-sample losses with loss functions."""
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning, message="Using a non-full backward hook*")
         
@@ -468,6 +563,59 @@ def _calculate_average_trn_loss(trn_sample_losses: list[torch.Tensor], n: int | 
     return torch.mean(trn_losses_latest).item()
 
 
+def _create_scheduler(
+    optimizer: torch.optim.Optimizer,
+    scheduler_type: str,
+    learning_rate: float,
+    total_steps: int,
+    warmup_steps: int,
+    min_lr_ratio: float = 0.01,
+    plateau_factor: float = 0.5,
+    plateau_patience: int = 4,
+) -> LRScheduler:
+    """Create learning rate scheduler based on type."""
+    
+    if scheduler_type == "warmup_cosine":
+        return WarmupCosineScheduler(
+            optimizer=optimizer,
+            warmup_steps=warmup_steps,
+            total_steps=total_steps,
+            min_lr_ratio=min_lr_ratio
+        )
+    
+    elif scheduler_type == "one_cycle":
+        return torch.optim.lr_scheduler.OneCycleLR(
+            optimizer=optimizer,
+            max_lr=learning_rate,
+            total_steps=total_steps,
+            pct_start=0.1,         
+            div_factor=25.0,       
+            final_div_factor=1000.0,
+        )
+    
+    elif scheduler_type == "adaptive_cosine":
+        return AdaptiveCosineScheduler(
+            optimizer=optimizer,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
+            learning_rate=learning_rate,
+            min_lr_ratio=min_lr_ratio
+        )
+    
+    else:  # plateau
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer=optimizer,
+            mode='min',
+            factor=plateau_factor,
+            patience=plateau_patience,
+            threshold=1e-4,
+            threshold_mode='rel',
+            cooldown=2,
+            min_lr=1e-7,
+            verbose=True
+        )
+
+
 ################
 ### TRAINING ###
 ################
@@ -488,27 +636,29 @@ def train(
     device: torch.device | str | None = None,
     workspace_dir: str | Path = "engine-ws",
     update_progress: ProgressCallback | None = None,
-    # Simplified enhancement parameters
-    use_mixed_precision: bool = True,
-    gradient_clip_norm: float = 1.0,
+    # Training parameters
+    use_mixed_precision: bool = False,
+    gradient_clip_norm: float | None = None,
     learning_rate: float | None = None,
-    scheduler_type: str = "warmup_cosine",  # "warmup_cosine", "one_cycle", "plateau"
+    scheduler_type: str = "warmup_cosine",  # "warmup_cosine", "one_cycle", "plateau", "adaptive_cosine"
     warmup_epochs: int = 5,
     min_lr_ratio: float = 0.01,
+    plateau_factor: float = 0.8,
+    plateau_patience: int = 2,
     weight_decay: float = 0.01,
     weight_decay_end: float | None = None,
     use_focal_loss: bool = False,
     focal_alpha: float = 1.0,
     focal_gamma: float = 2.0,
     label_smoothing: float = 0.1,
-    use_ema: bool = True,
+    use_ema: bool = False,
     ema_decay: float = 0.999,
     early_stopping_patience: int = 10,
     early_stopping_min_delta: float = 1e-4,
     **kwargs,
 ):
     """
-    Enhanced training function with simplified but effective optimizations.
+    Training function with optimizations for tabular data.
     
     Args:
         # Core parameters
@@ -526,25 +676,27 @@ def train(
         workspace_dir: Workspace directory path
         update_progress: Progress callback function
         
-        # Enhancement parameters
+        # Training parameters
         use_mixed_precision: Enable PyTorch native automatic mixed precision
-        gradient_clip_norm: Gradient clipping norm (1.0 recommended)
+        gradient_clip_norm: Gradient clipping norm
         learning_rate: Initial learning rate (auto-determined if None)
-        scheduler_type: LR scheduler type ("warmup_cosine", "one_cycle", "plateau")
+        scheduler_type: LR scheduler type
         warmup_epochs: Number of warmup epochs
         min_lr_ratio: Minimum LR as ratio of initial LR
+        plateau_factor: LR reduction factor for plateau scheduler
+        plateau_patience: Patience epochs for plateau scheduler
         weight_decay: Weight decay coefficient
         weight_decay_end: Final weight decay (for scheduling)
         use_focal_loss: Use focal loss for class imbalance
         focal_alpha: Focal loss alpha parameter
         focal_gamma: Focal loss gamma parameter
-        label_smoothing: Label smoothing factor (0.1 recommended)
+        label_smoothing: Label smoothing factor
         use_ema: Use exponential moving average of weights
         ema_decay: EMA decay factor
         early_stopping_patience: Early stopping patience
         early_stopping_min_delta: Minimum improvement threshold
     """
-    _LOG.info("ENHANCED_TRAIN_TABULAR started with simplified optimizations")
+    _LOG.info("TRAIN_TABULAR started")
     t0 = time.time()
     workspace_dir = ensure_workspace_dir(workspace_dir)
     workspace = Workspace(workspace_dir)
@@ -563,8 +715,8 @@ def train(
         _LOG.info(f"{device=}")
         torch.set_default_dtype(torch.float32)
 
-        # Log enhancement settings
-        _LOG.info("=== ENHANCEMENT SETTINGS ===")
+        # Log training settings
+        _LOG.info("=== TRAINING SETTINGS ===")
         _LOG.info(f"Mixed Precision: {use_mixed_precision}")
         _LOG.info(f"Gradient Clipping: {gradient_clip_norm}")
         _LOG.info(f"Scheduler: {scheduler_type}")
@@ -572,7 +724,7 @@ def train(
         _LOG.info(f"EMA: {use_ema} (decay={ema_decay})")
         _LOG.info(f"Focal Loss: {use_focal_loss}")
 
-        # Data preparation (same as original)
+        # Data preparation
         has_context = workspace.ctx_stats.path.exists()
         tgt_stats = workspace.tgt_stats.read()
         ctx_stats = workspace.ctx_stats.read()
@@ -603,6 +755,9 @@ def train(
             "MOSTLY_AI/Small": ModelSize.S,
             "MOSTLY_AI/Medium": ModelSize.M,
             "MOSTLY_AI/Large": ModelSize.L,
+            "MOSTLY_AI/XLarge": ModelSize.XL,
+            "MOSTLY_AI/XXLarge": ModelSize.XXL,
+            "MOSTLY_AI/XXXLarge": ModelSize.XXXL,
         }
         if model not in model_sizes:
             raise ValueError(f"model {model} not supported")
@@ -639,7 +794,7 @@ def train(
         torch.set_flush_denormal(True)
 
         _LOG.info("create training model")
-        model_checkpoint = TabularModelCheckpoint(workspace=workspace, save_ema=use_ema)
+        model_checkpoint = TabularModelCheckpoint(workspace=workspace)
         
         # Create model
         argn: SequentialModel | FlatModel
@@ -664,14 +819,6 @@ def train(
                 column_order=trn_column_order,
                 device=device,
             )
-            # argn = EnhancedFlatModel(
-            #     tgt_cardinalities=tgt_cardinalities,
-            #     ctx_cardinalities=ctx_cardinalities,
-            #     ctxseq_len_median=ctx_seq_len_median,
-            #     model_size=model_size,
-            #     column_order=trn_column_order,
-            #     device=device,
-            # )
         _LOG.info(f"model class: {argn.__class__.__name__}")
 
         # Handle model state strategy
@@ -750,7 +897,7 @@ def train(
         if is_sequential:
             val_batch_size = val_batch_size // 2
 
-        # Setup data loaders with simplified collator
+        # Setup data loaders
         batch_collator = SimpleBatchCollator(
             is_sequential=is_sequential, 
             max_sequence_window=max_sequence_window, 
@@ -784,14 +931,13 @@ def train(
         if ema_model:
             _LOG.info(f"EMA enabled with decay={ema_decay}")
 
-        # Enhanced early stopping
-        early_stopper_config = EnhancedEarlyStopperConfig(
+        # Early stopping
+        early_stopper_config = EarlyStopperConfig(
             patience=early_stopping_patience,
             min_delta=early_stopping_min_delta,
-            restore_best_weights=True,
             monitor_train_loss=True,
         )
-        early_stopper = EnhancedEarlyStopper(early_stopper_config)
+        early_stopper = ImprovedEarlyStopper(early_stopper_config)
 
         # Setup optimizer with weight decay scheduling
         if weight_decay_end is None:
@@ -801,32 +947,23 @@ def train(
             params=argn.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay,
-            eps=1e-8,
+            # eps=1e-8,
         )
 
         # Setup learning rate scheduler
         total_steps = int(max_epochs * trn_steps)
         warmup_steps = int(warmup_epochs * trn_steps)
         
-        if scheduler_type == "one_cycle":
-            lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                optimizer=optimizer,
-                max_lr=learning_rate,
-                steps_per_epoch=trn_steps,
-                epochs=int(max_epochs),
-            )
-        elif scheduler_type == "warmup_cosine":
-            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer=optimizer,
-                T_max=total_steps,
-            )
-        else:  # plateau
-            lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer=optimizer,
-                factor=0.5,
-                patience=4,
-                min_lr=1e-8,
-            )
+        lr_scheduler = _create_scheduler(
+            optimizer=optimizer,
+            scheduler_type=scheduler_type,
+            learning_rate=learning_rate,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
+            min_lr_ratio=min_lr_ratio,
+            plateau_factor=plateau_factor,
+            plateau_patience=plateau_patience,
+        )
         
         _LOG.info(f"Learning rate scheduler: {scheduler_type}")
 
@@ -899,7 +1036,7 @@ def train(
         # Gradient norm tracking
         gradient_norms: list[float] = []
         
-        _LOG.info("Starting enhanced training loop")
+        _LOG.info("Starting training loop")
         
         while not do_stop:
             is_checkpoint = 0
@@ -928,7 +1065,7 @@ def train(
                     trn_data_iter = iter(trn_dataloader)
                     step_data = next(trn_data_iter)
                 
-                # Forward pass with mixed precision
+                # Forward pass
                 step_losses = _calculate_sample_losses(
                     argn, step_data, device, use_mixed_precision, use_focal_loss, focal_alpha, focal_gamma, label_smoothing
                 )
@@ -938,7 +1075,7 @@ def train(
                 if with_dp:
                     optimizer.zero_grad(set_to_none=True)
                 
-                # Backward pass with mixed precision
+                # Backward pass
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=FutureWarning, message="Using a non-full backward hook*")
                     
@@ -983,7 +1120,7 @@ def train(
 
             # Learning rate scheduling
             current_lr = optimizer.param_groups[0]["lr"]
-            if scheduler_type != "plateau":
+            if scheduler_type not in ["plateau", "adaptive_cosine"]:
                 lr_scheduler.step()
 
             # Validation
@@ -1014,6 +1151,7 @@ def train(
                     load_model_weights(model=argn, path=workspace.model_tabular_weights_path, device=device)
                 
                 trn_loss = _calculate_average_trn_loss(trn_sample_losses)
+                
                 dp_total_epsilon = (
                     privacy_engine.get_epsilon(dp_total_delta) + dp_value_protection_epsilon if with_dp else None
                 )
@@ -1038,12 +1176,14 @@ def train(
                 else:
                     _LOG.info("early stopping: current DP epsilon has exceeded max epsilon")
                 
-                # Enhanced early stopping
+                # Early stopping
                 do_stop = early_stopper(val_loss=val_loss, train_loss=trn_loss) or has_exceeded_dp_max_epsilon
                 
-                # Plateau scheduler step
+                # Adaptive schedulers
                 if scheduler_type == "plateau":
                     lr_scheduler.step(metrics=val_loss)
+                elif scheduler_type == "adaptive_cosine":
+                    lr_scheduler.step_with_val_loss(val_loss)
                 
                 # Log gradient statistics
                 if gradient_norms:
@@ -1152,6 +1292,7 @@ def train(
                     model=argn,
                     val_dataloader=val_dataloader,
                     device=device,
+                    use_mixed_precision=use_mixed_precision,
                     use_focal_loss=use_focal_loss,
                     focal_alpha=focal_alpha,
                     focal_gamma=focal_gamma,
@@ -1189,15 +1330,17 @@ def train(
         if early_stopper.best_val_loss != float('inf'):
             _LOG.info(f"Best validation loss: {early_stopper.best_val_loss:.6f}")
         
-    _LOG.info(f"ENHANCED_TRAIN_TABULAR finished in {time.time() - t0:.2f}s")
+    _LOG.info(f"TRAIN_TABULAR finished in {time.time() - t0:.2f}s")
 
 
 __all__ = [
     "train",
     "EMAModel", 
+    "WarmupCosineScheduler",
+    "AdaptiveCosineScheduler",
     "FocalLoss",
     "SimpleBatchCollator",
-    "EnhancedEarlyStopper",
-    "EnhancedEarlyStopperConfig",
+    "ImprovedEarlyStopper",
+    "EarlyStopperConfig",
     "TabularModelCheckpoint",
 ]

@@ -48,8 +48,11 @@ _LOG = logging.getLogger(__name__)
 
 class ModelSize(str, Enum):
     S = "S"
-    M = "M"
+    M = "M" 
     L = "L"
+    XL = "XL"
+    XXL = "XXL"
+    XXXL = "XXXL"
 
 
 ModelSizeOrUnits = ModelSize | dict[str, list[int]]
@@ -111,16 +114,73 @@ def get_model_units(model: nn.Module) -> dict[str, Any]:
 ####################
 
 
+class ModelSize(str, Enum):
+    S = "S"
+    M = "M" 
+    L = "L"
+    XL = "XL"
+    XXL = "XXL"
+    XXXL = "XXXL"
+
+def _regressor_heuristic(id: str, model_size: ModelSizeOrUnits, dim_input: int, cardinality: int) -> list[int]:
+    if isinstance(model_size, dict):
+        return model_size[id]
+    
+    model_size_layers = dict(
+        S=[4], 
+        M=[16], 
+        L=[16, 16],
+        XL=[32, 32, 32],           # Deeper + wider
+        XXL=[64, 64, 64, 64],      # Even deeper + wider  
+        XXXL=[128, 128, 128, 128, 128]  # Very deep + wide
+    )
+    
+    dims = [dim_input]
+    layers = model_size_layers[model_size]
+    
+    # More aggressive scaling for larger models
+    for idx, unit in enumerate(layers[:-1]):
+        coefficient = round(np.log(max(dims[idx], np.e)))
+        dims.append(unit * coefficient)
+    
+    # Last layer depends on cardinality
+    unit = layers[-1]
+    coefficient = round(np.log(max(cardinality, np.e)))
+    dims.append(unit * coefficient)
+    return dims[1:]
+
 def _embedding_heuristic(id: str, model_size: ModelSizeOrUnits, dim_input: int) -> int:
     if isinstance(model_size, dict):
         return model_size[id]
+    
     model_size_output_dim = dict(
         S=max(10, int(2 * np.ceil(dim_input**0.15))),
         M=max(10, int(3 * np.ceil(dim_input**0.25))),
         L=max(10, int(4 * np.ceil(dim_input**0.33))),
+        XL=max(10, int(6 * np.ceil(dim_input**0.4))),      # More aggressive scaling
+        XXL=max(10, int(8 * np.ceil(dim_input**0.45))),
+        XXXL=max(10, int(12 * np.ceil(dim_input**0.5))),
     )
     return min(dim_input, model_size_output_dim[model_size])
 
+def _history_heuristic(id: str, model_size: ModelSizeOrUnits, dim_input: int, seq_len_median: int) -> list[int]:
+    if isinstance(model_size, dict):
+        return model_size[id]
+    
+    model_size_layers = dict(
+        S=[16], 
+        M=[64], 
+        L=[128, 128],
+        XL=[256, 256, 256],           # Much wider + deeper
+        XXL=[512, 512, 512, 512],     # Very wide + deep
+        XXXL=[1024, 1024, 1024, 1024, 1024]  # Extremely wide + deep
+    )
+    
+    layers = model_size_layers[model_size]
+    coefficient = round(np.log(max(dim_input * seq_len_median, np.e)))
+    
+    dims = [unit * coefficient for unit in layers]
+    return dims
 
 def _column_embedding_heuristic(
     id: str,
@@ -131,65 +191,60 @@ def _column_embedding_heuristic(
 ) -> int:
     if isinstance(model_size, dict):
         return model_size.get(id, dim_input)
+    
     model_size_output_dim = dict(
         S=int(4 + n_sub_cols),
         M=int(10 + n_sub_cols),
         L=int(16 + n_sub_cols),
+        XL=int(32 + n_sub_cols * 2),      # More aggressive sub-column scaling
+        XXL=int(64 + n_sub_cols * 3),     # Even more aggressive
+        XXXL=int(128 + n_sub_cols * 4),   # Very aggressive
     )
+    
     compress = compress_enabled and n_sub_cols > 2
     dim_output = model_size_output_dim[model_size] if compress else dim_input
     # dim_output should always be at most dim_input
     return min(dim_input, dim_output)
 
-
-def _regressor_heuristic(id: str, model_size: ModelSizeOrUnits, dim_input: int, cardinality: int) -> list[int]:
-    if isinstance(model_size, dict):
-        return model_size[id]
-    model_size_layers = dict(S=[4], M=[16], L=[16, 16])
-    dims = [dim_input]
-    layers = model_size_layers[model_size]
-    # first layers depend on input dimension
-    for idx, unit in enumerate(layers[:-1]):
-        coefficient = round(np.log(max(dims[idx], np.e)))
-        dims.append(unit * coefficient)
-    # last layer depends on cardinality
-    unit = layers[-1]
-    coefficient = round(np.log(max(cardinality, np.e)))
-    dims.append(unit * coefficient)
-    return dims[1:]
-
-
 def _flat_context_heuristic(id: str, model_size: ModelSizeOrUnits, dim_input: int) -> list[int]:
     if isinstance(model_size, dict):
         return model_size[id]
-    model_size_layers = dict(S=[8], M=[64], L=[128])
+    
+    model_size_layers = dict(
+        S=[8], 
+        M=[64], 
+        L=[128],
+        XL=[256, 256],                # Add depth + width
+        XXL=[512, 512, 256],          # More depth + width
+        XXXL=[1024, 1024, 512, 256]   # Very deep + wide with tapering
+    )
+    
     layers = model_size_layers[model_size]
     coefficient = round(np.log(max(dim_input, np.e)))
+    
     dims = [unit * coefficient for unit in layers]
     return dims
-
 
 def _sequential_context_heuristic(
     id: str, model_size: ModelSizeOrUnits, dim_input: int, seq_len_median: int
 ) -> list[int]:
     if isinstance(model_size, dict):
         return model_size[id]
-    model_size_layers = dict(S=[8], M=[32], L=[64, 64])
+    
+    model_size_layers = dict(
+        S=[8], 
+        M=[32], 
+        L=[64, 64],
+        XL=[128, 128, 128],           # Much deeper + wider
+        XXL=[256, 256, 256, 256],     # Very deep + wide
+        XXXL=[512, 512, 512, 512, 256]  # Extremely deep + wide with tapering
+    )
+    
     layers = model_size_layers[model_size]
     coefficient = round(np.log(max(dim_input * seq_len_median, np.e)))
+    
     dims = [unit * coefficient for unit in layers]
     return dims
-
-
-def _history_heuristic(id: str, model_size: ModelSizeOrUnits, dim_input: int, seq_len_median: int) -> list[int]:
-    if isinstance(model_size, dict):
-        return model_size[id]
-    model_size_layers = dict(S=[16], M=[64], L=[128, 128])
-    layers = model_size_layers[model_size]
-    coefficient = round(np.log(max(dim_input * seq_len_median, np.e)))
-    dims = [unit * coefficient for unit in layers]
-    return dims
-
 
 #######################
 ### BUILDING BLOCKS ###
