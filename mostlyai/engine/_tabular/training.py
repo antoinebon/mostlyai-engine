@@ -19,8 +19,6 @@ import warnings
 from itertools import zip_longest
 from pathlib import Path
 from collections.abc import Callable
-from typing import Any
-from dataclasses import dataclass
 
 from importlib.metadata import version
 import numpy as np
@@ -114,307 +112,6 @@ def _learn_rate_heuristic(batch_size: int) -> float:
     return np.round(0.001 * np.sqrt(batch_size / 32), 5)
 
 
-#######################
-### WEIGHT INITIALIZATION ###
-#######################
-
-
-def init_embedding_weights(module: nn.Embedding, std: float = 0.1) -> None:
-    """
-    Initialize embedding weights with small normal distribution.
-    
-    Args:
-        module: Embedding layer to initialize
-        std: Standard deviation for normal distribution
-    
-    Why this works:
-    - Small embeddings prevent initial saturation
-    - Normal distribution works better than uniform for embeddings
-    - 0.1 std is empirically good for categorical embeddings
-    """
-    nn.init.normal_(module.weight, mean=0.0, std=std)
-
-
-def init_lstm_weights(module: nn.LSTM, forget_bias: float = 1.0) -> None:
-    """
-    Initialize LSTM weights with proper orthogonal/xavier strategy.
-    
-    Args:
-        module: LSTM module to initialize
-        forget_bias: Bias value for forget gate
-    
-    Why this works:
-    - Input-to-hidden: Xavier for balanced gradients
-    - Hidden-to-hidden: Orthogonal prevents vanishing/exploding gradients
-    - Bias: Zero except forget gate (configurable for better gradient flow)
-    """
-    for name, param in module.named_parameters():
-        if 'weight_ih' in name:  # Input-to-hidden weights
-            nn.init.xavier_normal_(param)
-        elif 'weight_hh' in name:  # Hidden-to-hidden weights
-            nn.init.orthogonal_(param)
-        elif 'bias' in name:  # Biases
-            nn.init.zeros_(param)
-            # Set forget gate bias (LSTM has 4 gates: i, f, g, o)
-            n = param.size(0)
-            param.data[n//4:n//2].fill_(forget_bias)  # Forget gate bias
-
-
-def init_linear_weights(module: nn.Linear, activation: str = 'relu') -> None:
-    """
-    Initialize linear layer weights based on activation function.
-    
-    Args:
-        module: Linear layer to initialize
-        activation: Type of activation following this layer
-    
-    Why this works:
-    - He initialization for ReLU prevents dying neurons
-    - Xavier for other activations maintains gradient scale
-    - Small bias initialization prevents initial saturation
-    """
-    if activation.lower() == 'relu':
-        # He initialization for ReLU
-        nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
-    elif activation.lower() in ['sigmoid', 'tanh']:
-        # Xavier for sigmoid/tanh
-        nn.init.xavier_normal_(module.weight)
-    else:
-        # Default to Xavier for unknown activations
-        nn.init.xavier_normal_(module.weight)
-    
-    # Small bias initialization
-    if module.bias is not None:
-        nn.init.zeros_(module.bias)
-
-
-def create_class_priors_from_data(
-    target_data: dict[str, torch.Tensor],
-    cardinalities: dict[str, int],
-) -> dict[str, torch.Tensor]:
-    """
-    Compute class priors from training data for bias initialization.
-    
-    Args:
-        target_data: Dictionary mapping column names to target tensors
-        cardinalities: Dictionary mapping column names to their cardinalities
-        
-    Returns:
-        Dictionary mapping column names to class prior probabilities
-    """
-    priors = {}
-    
-    for col_name, targets in target_data.items():
-        if col_name not in cardinalities:
-            continue
-            
-        expected_cardinality = cardinalities[col_name]
-        
-        # Count class frequencies
-        unique_vals, counts = torch.unique(targets, return_counts=True)
-        
-        # Convert to probabilities
-        probs = counts.float() / counts.sum()
-        
-        # Create full prior vector with expected cardinality
-        full_priors = torch.zeros(expected_cardinality)
-        
-        # Only use values that are within the expected range
-        valid_mask = unique_vals < expected_cardinality
-        valid_vals = unique_vals[valid_mask]
-        valid_probs = probs[valid_mask]
-        
-        if len(valid_vals) > 0:
-            full_priors[valid_vals] = valid_probs
-        
-        # Add small smoothing to avoid log(0) and ensure probabilities sum to 1
-        full_priors = full_priors + 1e-8
-        full_priors = full_priors / full_priors.sum()
-        
-        priors[col_name] = full_priors
-    
-    return priors
-
-
-def init_final_prediction_layer(
-    module: nn.Linear, 
-    num_classes: int, 
-    class_prior: torch.Tensor | None = None,
-    scale: float = 1.0,
-) -> None:
-    """
-    Initialize final prediction layer with class-aware strategy.
-    
-    Args:
-        module: Final linear layer outputting logits
-        num_classes: Number of output classes
-        class_prior: Prior class probabilities for bias initialization
-        scale: Scale factor for weight initialization
-    
-    Why this works:
-    - Smaller weight init prevents initial confidence saturation
-    - Bias initialization with class priors helps with imbalanced data
-    - Works well with cross-entropy loss and softmax
-    """
-    # Smaller initialization for final layer with scaling
-    std = np.sqrt(scale / (module.in_features * num_classes))
-    nn.init.normal_(module.weight, mean=0.0, std=std)
-    
-    if module.bias is not None:
-        if class_prior is not None:
-            # Ensure class_prior matches expected output size
-            if class_prior.size(0) != module.bias.size(0):
-                _LOG.warning(
-                    f"Class prior size mismatch: expected {module.bias.size(0)}, "
-                    f"got {class_prior.size(0)}. Using zero initialization."
-                )
-                nn.init.zeros_(module.bias)
-            else:
-                # Initialize bias with log class priors
-                log_priors = torch.log(class_prior + 1e-8)
-                module.bias.data.copy_(log_priors)
-        else:
-            nn.init.zeros_(module.bias)
-
-
-def get_initialization_config(
-    model_size: str, 
-    cardinalities: dict[str, int],
-    use_conservative_init: bool = True
-) -> dict[str, Any]:
-    """
-    Get initialization configuration based on model characteristics.
-    
-    Args:
-        model_size: Model size string (e.g., "MOSTLY_AI/Large")
-        cardinalities: Target column cardinalities
-        use_conservative_init: Whether to use more conservative initialization
-        
-    Returns:
-        Dictionary of initialization parameters
-    """
-    # More conservative initialization for larger models and high cardinality data
-    max_cardinality = max(cardinalities.values()) if cardinalities else 100
-    avg_cardinality = sum(cardinalities.values()) / len(cardinalities) if cardinalities else 10
-    
-    if "Large" in model_size:
-        embedding_std = 0.05 if use_conservative_init else 0.1
-        final_layer_scale = 0.3
-    elif avg_cardinality > 1000 or max_cardinality > 10000:
-        embedding_std = 0.08
-        final_layer_scale = 0.5
-    else:
-        embedding_std = 0.1
-        final_layer_scale = 1.0
-    
-    return {
-        'embedding_std': embedding_std,
-        'final_layer_scale': final_layer_scale,
-        'lstm_forget_bias': 1.0,
-    }
-
-
-def initialize_tabular_argn_weights(
-    model: nn.Module, 
-    cardinalities: dict[str, int],
-    class_priors: dict[str, torch.Tensor] | None = None,
-    embedding_std: float = 0.1,
-    final_layer_scale: float = 1.0,
-    lstm_forget_bias: float = 1.0,
-) -> None:
-    """
-    Comprehensive initialization for TabularARGN models.
-    
-    Args:
-        model: The TabularARGN model to initialize
-        cardinalities: Dictionary mapping column names to their cardinalities
-        class_priors: Optional class prior probabilities for each target column
-        embedding_std: Standard deviation for embedding initialization
-        final_layer_scale: Scale factor for final layer initialization
-        lstm_forget_bias: Bias value for LSTM forget gates
-    """
-    class_priors = class_priors or {}
-    
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Embedding):
-            # Embeddings: Small normal initialization
-            init_embedding_weights(module, std=embedding_std)
-            _LOG.debug(f"Initialized embedding {name} with std={embedding_std}")
-            
-        elif isinstance(module, nn.LSTM):
-            # LSTM: Orthogonal + Xavier strategy with custom forget bias
-            init_lstm_weights(module, forget_bias=lstm_forget_bias)
-            _LOG.debug(f"Initialized LSTM {name} with forget_bias={lstm_forget_bias}")
-            
-        elif isinstance(module, nn.Linear):
-            # Determine if this is a final prediction layer
-            is_final_layer = any(
-                col in name and 'predictor' in name 
-                for col in cardinalities.keys()
-            )
-            
-            if is_final_layer:
-                # Extract column name from module name
-                col_name = None
-                for col in cardinalities.keys():
-                    if col in name:
-                        col_name = col
-                        break
-                
-                if col_name:
-                    num_classes = cardinalities[col_name]
-                    prior = class_priors.get(col_name)
-                    init_final_prediction_layer(
-                        module, num_classes, prior, scale=final_layer_scale
-                    )
-                    _LOG.debug(f"Initialized final layer {name} for {num_classes} classes")
-                else:
-                    init_linear_weights(module, activation='relu')
-            else:
-                # Regular linear layer - assume ReLU activation
-                init_linear_weights(module, activation='relu')
-                _LOG.debug(f"Initialized linear layer {name} with He initialization")
-
-
-def apply_tabular_argn_initialization(
-    model: nn.Module,
-    model_size: str,
-    cardinalities: dict[str, int],
-    train_targets: dict[str, torch.Tensor] | None = None,
-    use_conservative_init: bool = True,
-) -> None:
-    """
-    Apply optimized weight initialization to TabularARGN model.
-    
-    Args:
-        model: The model to initialize
-        model_size: Model size string for configuration
-        cardinalities: Target column cardinalities
-        train_targets: Optional training targets for class priors
-        use_conservative_init: Whether to use conservative initialization
-        
-    Raises:
-        ValueError: If model_size is not recognized
-    """
-    # Get initialization configuration
-    init_config = get_initialization_config(model_size, cardinalities, use_conservative_init)
-    
-    # Compute class priors if training data provided
-    class_priors = None
-    if train_targets is not None:
-        class_priors = create_class_priors_from_data(train_targets, cardinalities)
-    
-    # Apply initialization
-    initialize_tabular_argn_weights(
-        model=model,
-        cardinalities=cardinalities,
-        class_priors=class_priors,
-        **init_config
-    )
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    _LOG.info(f"Applied weight initialization to model with {total_params:,} parameters")
-    _LOG.info(f"Initialization config: {init_config}")
 
 ########################
 ### EMA MODEL WRAPPER ###
@@ -655,61 +352,6 @@ class SimpleBatchCollator:
         return pd.DataFrame(rows, columns=batch.columns, index=batch.index)
 
 
-#########################
-### EARLY STOPPING ###
-#########################
-
-
-@dataclass
-class EarlyStopperConfig:
-    """Configuration for early stopping."""
-    patience: int = 10
-    min_delta: float = 1e-4
-    monitor_train_loss: bool = True
-    divergence_threshold: float = 2.0
-
-
-class ImprovedEarlyStopper:
-    """Early stopping with multiple criteria."""
-    
-    def __init__(self, config: EarlyStopperConfig):
-        self._config = config
-        self._best_val_loss = float('inf')
-        self._patience_counter = 0
-        self._train_losses: list[float] = []
-        self._val_losses: list[float] = []
-        
-    def __call__(self, val_loss: float, train_loss: float | None = None) -> bool:
-        """Check if training should stop early."""
-        self._val_losses.append(val_loss)
-        if train_loss is not None:
-            self._train_losses.append(train_loss)
-        
-        if val_loss < self._best_val_loss - self._config.min_delta:
-            self._best_val_loss = val_loss
-            self._patience_counter = 0
-        else:
-            self._patience_counter += 1
-        
-        if self._patience_counter >= self._config.patience:
-            _LOG.info(f"Early stopping: no improvement for {self._config.patience} epochs")
-            return True
-        
-        if (self._config.monitor_train_loss and 
-            len(self._train_losses) >= 5 and 
-            train_loss is not None):
-            recent_train_avg = np.mean(self._train_losses[-5:])
-            if recent_train_avg > self._config.divergence_threshold * self._best_val_loss:
-                _LOG.info("Early stopping: training loss divergence detected")
-                return True
-        
-        return False
-    
-    @property
-    def best_val_loss(self) -> float:
-        """Get the best validation loss observed."""
-        return self._best_val_loss
-
 
 #####################
 ### TRAINING LOOP ###
@@ -940,7 +582,6 @@ def train(
     early_stopping_patience: int = 5,
     early_stopping_min_delta: float = 1e-4,
     # Weight initialization parameters
-    use_custom_initialization: bool = False,
     conservative_initialization: bool = False,
     compute_class_priors: bool = False,
     # Dropout parameters
@@ -987,11 +628,6 @@ def train(
         early_stopping_patience: Early stopping patience
         early_stopping_min_delta: Minimum improvement threshold
         
-        # Weight initialization parameters
-        use_custom_initialization: Enable optimized weight initialization
-        conservative_initialization: Use more conservative init for large models
-        compute_class_priors: Compute class priors from training data
-        
         # Dropout parameters
         dnn_dropout: Dropout rate for DNN layers (default: 0.5)
         lstm_dropout: Dropout rate for LSTM layers (default: 0.1)
@@ -1022,7 +658,6 @@ def train(
         _LOG.info(f"Label Smoothing: {label_smoothing}")
         _LOG.info(f"EMA: {use_ema} (decay={ema_decay})")
         _LOG.info(f"Focal Loss: {use_focal_loss}")
-        _LOG.info(f"Custom Init: {use_custom_initialization}")
         _LOG.info(f"DNN Dropout: {dnn_dropout}")
         _LOG.info(f"LSTM Dropout: {lstm_dropout}")
 
@@ -1136,47 +771,6 @@ def train(
             _LOG.info("remove existing checkpoint files")
             model_checkpoint.clear_checkpoint()
             
-            # Apply custom weight initialization for new models
-            if use_custom_initialization:
-                _LOG.info("applying custom weight initialization")
-    
-                # Optionally prepare training targets for class priors
-                train_targets = None
-                if compute_class_priors:
-                    try:
-                        disable_progress_bar()
-                        sample_data = load_dataset("parquet", data_files=[str(p) for p in workspace.encoded_data_trn.fetch_all()])["train"]
-                        sample_data = sample_data[:10000]
-            
-                        train_targets = {}
-                        for col in tgt_cardinalities.keys():
-                            # Handle both sequential and flat data
-                            col_data = sample_data[col]
-                            if is_sequential:
-                                # Flatten sequences for class counting
-                                flattened = []
-                                for seq in col_data:
-                                    if isinstance(seq, list):
-                                        flattened.extend(seq)
-                                    else:
-                                        flattened.append(seq)
-                                train_targets[col] = torch.tensor(flattened, dtype=torch.int64)
-                            else:
-                                train_targets[col] = torch.tensor(col_data, dtype=torch.int64)
-            
-                    except Exception as e:
-                        _LOG.warning(f"could not compute class priors: {e}")
-                        train_targets = None
-    
-                # Apply initialization - now passing cardinalities to ensure proper sizing
-                apply_tabular_argn_initialization(
-                    model=argn,
-                    model_size=model,
-                    cardinalities=tgt_cardinalities,
-                    train_targets=train_targets,
-                    use_conservative_init=conservative_initialization,
-                )
-                
         # Handle progress state
         last_progress_message = progress.get_last_progress_message()
         if last_progress_message and model_state_strategy == ModelStateStrategy.resume:
@@ -1274,12 +868,7 @@ def train(
             _LOG.info(f"EMA enabled with decay={ema_decay}")
 
         # Early stopping
-        early_stopper_config = EarlyStopperConfig(
-            patience=early_stopping_patience,
-            min_delta=early_stopping_min_delta,
-            monitor_train_loss=True,
-        )
-        early_stopper = ImprovedEarlyStopper(early_stopper_config)
+        early_stopper = EarlyStopper(early_stopping_patience)
 
         # Setup optimizer with weight decay scheduling
         if weight_decay_end is None:
@@ -1754,15 +1343,5 @@ __all__ = [
     "AdaptiveCosineScheduler",
     "FocalLoss",
     "SimpleBatchCollator",
-    "ImprovedEarlyStopper",
-    "EarlyStopperConfig",
     "TabularModelCheckpoint",
-    "apply_tabular_argn_initialization",
-    "init_embedding_weights",
-    "init_lstm_weights", 
-    "init_linear_weights",
-    "init_final_prediction_layer",
-    "create_class_priors_from_data",
-    "get_initialization_config",
-    "initialize_tabular_argn_weights",
 ]
