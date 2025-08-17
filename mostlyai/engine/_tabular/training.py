@@ -538,7 +538,6 @@ def _create_scheduler(
             threshold_mode='rel',
             cooldown=0,
             min_lr=1e-7,
-            verbose=True
         )
 
 
@@ -1107,7 +1106,7 @@ def train(
                     _LOG.info("early stopping: current DP epsilon has exceeded max epsilon")
                 
                 # Early stopping
-                do_stop = early_stopper(val_loss=val_loss, train_loss=trn_loss) or has_exceeded_dp_max_epsilon
+                do_stop = early_stopper(val_loss) or has_exceeded_dp_max_epsilon
                 
                 # Adaptive schedulers
                 if scheduler_type == "plateau":
@@ -1257,8 +1256,8 @@ def train(
         # Log final statistics
         if gradient_norms:
             _LOG.info(f"Final gradient statistics: mean={np.mean(gradient_norms):.4f}, std={np.std(gradient_norms):.4f}")
-        if early_stopper.best_val_loss != float('inf'):
-            _LOG.info(f"Best validation loss: {early_stopper.best_val_loss:.6f}")
+        if early_stopper.best_loss != float('inf'):
+            _LOG.info(f"Best validation loss: {early_stopper.best_loss:.6f}")
         
     _LOG.info(f"TRAIN_TABULAR finished in {time.time() - t0:.2f}s")
 
