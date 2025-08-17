@@ -91,10 +91,8 @@ def _physical_batch_size_heuristic(
     data_points = no_tgt_data_points + no_ctx_data_points
     min_batch_size = 8
     
-    # Scale batch_size corresponding to available memory
     mem_scale = 2.0 if mem_available_gb >= 32 else 1.0 if mem_available_gb >= 8 else 0.5
     
-    # Set max_batch_size corresponding to available memory, model params and data points
     if no_of_model_params > 1_000_000_000 or data_points > 100_000:
         max_batch_size = int(8 * mem_scale)
     elif no_of_model_params > 100_000_000 or data_points > 10_000:
@@ -106,7 +104,6 @@ def _physical_batch_size_heuristic(
     else:
         max_batch_size = int(2048 * mem_scale)
     
-    # Ensure a minimum number of batches to avoid excessive padding
     min_batches = 64
     batch_size = 2 ** int(np.log2(no_of_records / min_batches)) if no_of_records > 0 else min_batch_size
     return int(np.clip(a=batch_size, a_min=min_batch_size, a_max=max_batch_size))
@@ -116,6 +113,308 @@ def _learn_rate_heuristic(batch_size: int) -> float:
     """Calculate initial learning rate based on batch size."""
     return np.round(0.001 * np.sqrt(batch_size / 32), 5)
 
+
+#######################
+### WEIGHT INITIALIZATION ###
+#######################
+
+
+def init_embedding_weights(module: nn.Embedding, std: float = 0.1) -> None:
+    """
+    Initialize embedding weights with small normal distribution.
+    
+    Args:
+        module: Embedding layer to initialize
+        std: Standard deviation for normal distribution
+    
+    Why this works:
+    - Small embeddings prevent initial saturation
+    - Normal distribution works better than uniform for embeddings
+    - 0.1 std is empirically good for categorical embeddings
+    """
+    nn.init.normal_(module.weight, mean=0.0, std=std)
+
+
+def init_lstm_weights(module: nn.LSTM, forget_bias: float = 1.0) -> None:
+    """
+    Initialize LSTM weights with proper orthogonal/xavier strategy.
+    
+    Args:
+        module: LSTM module to initialize
+        forget_bias: Bias value for forget gate
+    
+    Why this works:
+    - Input-to-hidden: Xavier for balanced gradients
+    - Hidden-to-hidden: Orthogonal prevents vanishing/exploding gradients
+    - Bias: Zero except forget gate (configurable for better gradient flow)
+    """
+    for name, param in module.named_parameters():
+        if 'weight_ih' in name:  # Input-to-hidden weights
+            nn.init.xavier_normal_(param)
+        elif 'weight_hh' in name:  # Hidden-to-hidden weights
+            nn.init.orthogonal_(param)
+        elif 'bias' in name:  # Biases
+            nn.init.zeros_(param)
+            # Set forget gate bias (LSTM has 4 gates: i, f, g, o)
+            n = param.size(0)
+            param.data[n//4:n//2].fill_(forget_bias)  # Forget gate bias
+
+
+def init_linear_weights(module: nn.Linear, activation: str = 'relu') -> None:
+    """
+    Initialize linear layer weights based on activation function.
+    
+    Args:
+        module: Linear layer to initialize
+        activation: Type of activation following this layer
+    
+    Why this works:
+    - He initialization for ReLU prevents dying neurons
+    - Xavier for other activations maintains gradient scale
+    - Small bias initialization prevents initial saturation
+    """
+    if activation.lower() == 'relu':
+        # He initialization for ReLU
+        nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+    elif activation.lower() in ['sigmoid', 'tanh']:
+        # Xavier for sigmoid/tanh
+        nn.init.xavier_normal_(module.weight)
+    else:
+        # Default to Xavier for unknown activations
+        nn.init.xavier_normal_(module.weight)
+    
+    # Small bias initialization
+    if module.bias is not None:
+        nn.init.zeros_(module.bias)
+
+
+def create_class_priors_from_data(
+    target_data: dict[str, torch.Tensor],
+    cardinalities: dict[str, int],
+) -> dict[str, torch.Tensor]:
+    """
+    Compute class priors from training data for bias initialization.
+    
+    Args:
+        target_data: Dictionary mapping column names to target tensors
+        cardinalities: Dictionary mapping column names to their cardinalities
+        
+    Returns:
+        Dictionary mapping column names to class prior probabilities
+    """
+    priors = {}
+    
+    for col_name, targets in target_data.items():
+        if col_name not in cardinalities:
+            continue
+            
+        expected_cardinality = cardinalities[col_name]
+        
+        # Count class frequencies
+        unique_vals, counts = torch.unique(targets, return_counts=True)
+        
+        # Convert to probabilities
+        probs = counts.float() / counts.sum()
+        
+        # Create full prior vector with expected cardinality
+        full_priors = torch.zeros(expected_cardinality)
+        
+        # Only use values that are within the expected range
+        valid_mask = unique_vals < expected_cardinality
+        valid_vals = unique_vals[valid_mask]
+        valid_probs = probs[valid_mask]
+        
+        if len(valid_vals) > 0:
+            full_priors[valid_vals] = valid_probs
+        
+        # Add small smoothing to avoid log(0) and ensure probabilities sum to 1
+        full_priors = full_priors + 1e-8
+        full_priors = full_priors / full_priors.sum()
+        
+        priors[col_name] = full_priors
+    
+    return priors
+
+
+def init_final_prediction_layer(
+    module: nn.Linear, 
+    num_classes: int, 
+    class_prior: torch.Tensor | None = None,
+    scale: float = 1.0,
+) -> None:
+    """
+    Initialize final prediction layer with class-aware strategy.
+    
+    Args:
+        module: Final linear layer outputting logits
+        num_classes: Number of output classes
+        class_prior: Prior class probabilities for bias initialization
+        scale: Scale factor for weight initialization
+    
+    Why this works:
+    - Smaller weight init prevents initial confidence saturation
+    - Bias initialization with class priors helps with imbalanced data
+    - Works well with cross-entropy loss and softmax
+    """
+    # Smaller initialization for final layer with scaling
+    std = np.sqrt(scale / (module.in_features * num_classes))
+    nn.init.normal_(module.weight, mean=0.0, std=std)
+    
+    if module.bias is not None:
+        if class_prior is not None:
+            # Ensure class_prior matches expected output size
+            if class_prior.size(0) != module.bias.size(0):
+                _LOG.warning(
+                    f"Class prior size mismatch: expected {module.bias.size(0)}, "
+                    f"got {class_prior.size(0)}. Using zero initialization."
+                )
+                nn.init.zeros_(module.bias)
+            else:
+                # Initialize bias with log class priors
+                log_priors = torch.log(class_prior + 1e-8)
+                module.bias.data.copy_(log_priors)
+        else:
+            nn.init.zeros_(module.bias)
+
+
+def get_initialization_config(
+    model_size: str, 
+    cardinalities: dict[str, int],
+    use_conservative_init: bool = True
+) -> dict[str, Any]:
+    """
+    Get initialization configuration based on model characteristics.
+    
+    Args:
+        model_size: Model size string (e.g., "MOSTLY_AI/Large")
+        cardinalities: Target column cardinalities
+        use_conservative_init: Whether to use more conservative initialization
+        
+    Returns:
+        Dictionary of initialization parameters
+    """
+    # More conservative initialization for larger models and high cardinality data
+    max_cardinality = max(cardinalities.values()) if cardinalities else 100
+    avg_cardinality = sum(cardinalities.values()) / len(cardinalities) if cardinalities else 10
+    
+    if "Large" in model_size:
+        embedding_std = 0.05 if use_conservative_init else 0.1
+        final_layer_scale = 0.3
+    elif avg_cardinality > 1000 or max_cardinality > 10000:
+        embedding_std = 0.08
+        final_layer_scale = 0.5
+    else:
+        embedding_std = 0.1
+        final_layer_scale = 1.0
+    
+    return {
+        'embedding_std': embedding_std,
+        'final_layer_scale': final_layer_scale,
+        'lstm_forget_bias': 1.0,
+    }
+
+
+def initialize_tabular_argn_weights(
+    model: nn.Module, 
+    cardinalities: dict[str, int],
+    class_priors: dict[str, torch.Tensor] | None = None,
+    embedding_std: float = 0.1,
+    final_layer_scale: float = 1.0,
+    lstm_forget_bias: float = 1.0,
+) -> None:
+    """
+    Comprehensive initialization for TabularARGN models.
+    
+    Args:
+        model: The TabularARGN model to initialize
+        cardinalities: Dictionary mapping column names to their cardinalities
+        class_priors: Optional class prior probabilities for each target column
+        embedding_std: Standard deviation for embedding initialization
+        final_layer_scale: Scale factor for final layer initialization
+        lstm_forget_bias: Bias value for LSTM forget gates
+    """
+    class_priors = class_priors or {}
+    
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Embedding):
+            # Embeddings: Small normal initialization
+            init_embedding_weights(module, std=embedding_std)
+            _LOG.debug(f"Initialized embedding {name} with std={embedding_std}")
+            
+        elif isinstance(module, nn.LSTM):
+            # LSTM: Orthogonal + Xavier strategy with custom forget bias
+            init_lstm_weights(module, forget_bias=lstm_forget_bias)
+            _LOG.debug(f"Initialized LSTM {name} with forget_bias={lstm_forget_bias}")
+            
+        elif isinstance(module, nn.Linear):
+            # Determine if this is a final prediction layer
+            is_final_layer = any(
+                col in name and 'predictor' in name 
+                for col in cardinalities.keys()
+            )
+            
+            if is_final_layer:
+                # Extract column name from module name
+                col_name = None
+                for col in cardinalities.keys():
+                    if col in name:
+                        col_name = col
+                        break
+                
+                if col_name:
+                    num_classes = cardinalities[col_name]
+                    prior = class_priors.get(col_name)
+                    init_final_prediction_layer(
+                        module, num_classes, prior, scale=final_layer_scale
+                    )
+                    _LOG.debug(f"Initialized final layer {name} for {num_classes} classes")
+                else:
+                    init_linear_weights(module, activation='relu')
+            else:
+                # Regular linear layer - assume ReLU activation
+                init_linear_weights(module, activation='relu')
+                _LOG.debug(f"Initialized linear layer {name} with He initialization")
+
+
+def apply_tabular_argn_initialization(
+    model: nn.Module,
+    model_size: str,
+    cardinalities: dict[str, int],
+    train_targets: dict[str, torch.Tensor] | None = None,
+    use_conservative_init: bool = True,
+) -> None:
+    """
+    Apply optimized weight initialization to TabularARGN model.
+    
+    Args:
+        model: The model to initialize
+        model_size: Model size string for configuration
+        cardinalities: Target column cardinalities
+        train_targets: Optional training targets for class priors
+        use_conservative_init: Whether to use conservative initialization
+        
+    Raises:
+        ValueError: If model_size is not recognized
+    """
+    # Get initialization configuration
+    init_config = get_initialization_config(model_size, cardinalities, use_conservative_init)
+    
+    # Compute class priors if training data provided
+    class_priors = None
+    if train_targets is not None:
+        class_priors = create_class_priors_from_data(train_targets, cardinalities)
+    
+    # Apply initialization
+    initialize_tabular_argn_weights(
+        model=model,
+        cardinalities=cardinalities,
+        class_priors=class_priors,
+        **init_config
+    )
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    _LOG.info(f"Applied weight initialization to model with {total_params:,} parameters")
+    _LOG.info(f"Initialization config: {init_config}")
 
 ########################
 ### EMA MODEL WRAPPER ###
@@ -131,7 +430,6 @@ class EMAModel:
         self._shadow: dict[str, torch.Tensor] = {}
         self._backup: dict[str, torch.Tensor] = {}
         
-        # Initialize shadow weights
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self._shadow[name] = param.data.clone()
@@ -182,11 +480,9 @@ class WarmupCosineScheduler(LRScheduler):
     
     def get_lr(self) -> list[float]:
         if self.last_epoch < self.warmup_steps:
-            # Warmup phase
             warmup_factor = (self.last_epoch + 1) / self.warmup_steps
             return [base_lr * warmup_factor for base_lr in self.base_lrs]
         else:
-            # Cosine annealing phase
             progress = (self.last_epoch - self.warmup_steps) / (self.total_steps - self.warmup_steps)
             cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
             return [
@@ -214,7 +510,6 @@ class AdaptiveCosineScheduler(LRScheduler):
         self.base_learning_rate = learning_rate
         self.min_lr_ratio = min_lr_ratio
         
-        # Plateau detection
         self.patience = patience
         self.factor = factor
         self.best_val_loss = float('inf')
@@ -224,34 +519,27 @@ class AdaptiveCosineScheduler(LRScheduler):
         super().__init__(optimizer, last_epoch)
     
     def get_lr(self) -> list[float]:
-        # Calculate base cosine LR
         if self.last_epoch < self.warmup_steps:
-            # Warmup
             warmup_factor = (self.last_epoch + 1) / self.warmup_steps
             base_factor = warmup_factor
         else:
-            # Cosine annealing
             progress = (self.last_epoch - self.warmup_steps) / (self.total_steps - self.warmup_steps)
             cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
             base_factor = self.min_lr_ratio + (1 - self.min_lr_ratio) * cosine_factor
         
-        # Apply adaptive reduction
         final_lr = self.base_learning_rate * base_factor * self.reduction_factor
         return [final_lr for _ in self.base_lrs]
     
     def step_with_val_loss(self, val_loss: float) -> None:
         """Step scheduler with validation loss for adaptive behavior."""
-        # Regular step
         self.step()
         
-        # Check for plateau
         if val_loss < self.best_val_loss - 1e-4:
             self.best_val_loss = val_loss
             self.patience_counter = 0
         else:
             self.patience_counter += 1
             
-        # Apply additional reduction if plateau detected
         if self.patience_counter >= self.patience:
             old_factor = self.reduction_factor
             self.reduction_factor *= self.factor
@@ -393,24 +681,20 @@ class ImprovedEarlyStopper:
         
     def __call__(self, val_loss: float, train_loss: float | None = None) -> bool:
         """Check if training should stop early."""
-        # Track losses
         self._val_losses.append(val_loss)
         if train_loss is not None:
             self._train_losses.append(train_loss)
         
-        # Check for improvement
         if val_loss < self._best_val_loss - self._config.min_delta:
             self._best_val_loss = val_loss
             self._patience_counter = 0
         else:
             self._patience_counter += 1
         
-        # Check patience
         if self._patience_counter >= self._config.patience:
             _LOG.info(f"Early stopping: no improvement for {self._config.patience} epochs")
             return True
         
-        # Check for training loss divergence
         if (self._config.monitor_train_loss and 
             len(self._train_losses) >= 5 and 
             train_loss is not None):
@@ -571,7 +855,7 @@ def _create_scheduler(
     warmup_steps: int,
     min_lr_ratio: float = 0.01,
     plateau_factor: float = 0.5,
-    plateau_patience: int = 4,
+    plateau_patience: int = 2,
 ) -> LRScheduler:
     """Create learning rate scheduler based on type."""
     
@@ -610,7 +894,7 @@ def _create_scheduler(
             patience=plateau_patience,
             threshold=1e-4,
             threshold_mode='rel',
-            cooldown=2,
+            cooldown=0,
             min_lr=1e-7,
             verbose=True
         )
@@ -640,21 +924,28 @@ def train(
     use_mixed_precision: bool = False,
     gradient_clip_norm: float | None = None,
     learning_rate: float | None = None,
-    scheduler_type: str = "warmup_cosine",  # "warmup_cosine", "one_cycle", "plateau", "adaptive_cosine"
+    scheduler_type: str = "plateau",  # "warmup_cosine", "one_cycle", "plateau", "adaptive_cosine"
     warmup_epochs: int = 5,
     min_lr_ratio: float = 0.01,
-    plateau_factor: float = 0.8,
+    plateau_factor: float = 0.5,
     plateau_patience: int = 2,
     weight_decay: float = 0.01,
     weight_decay_end: float | None = None,
     use_focal_loss: bool = False,
     focal_alpha: float = 1.0,
     focal_gamma: float = 2.0,
-    label_smoothing: float = 0.1,
+    label_smoothing: float = 0.0,
     use_ema: bool = False,
     ema_decay: float = 0.999,
-    early_stopping_patience: int = 10,
+    early_stopping_patience: int = 5,
     early_stopping_min_delta: float = 1e-4,
+    # Weight initialization parameters
+    use_custom_initialization: bool = False,
+    conservative_initialization: bool = False,
+    compute_class_priors: bool = False,
+    # Dropout parameters
+    dnn_dropout: float = 0.25,
+    lstm_dropout: float = 0.0,
     **kwargs,
 ):
     """
@@ -695,6 +986,15 @@ def train(
         ema_decay: EMA decay factor
         early_stopping_patience: Early stopping patience
         early_stopping_min_delta: Minimum improvement threshold
+        
+        # Weight initialization parameters
+        use_custom_initialization: Enable optimized weight initialization
+        conservative_initialization: Use more conservative init for large models
+        compute_class_priors: Compute class priors from training data
+        
+        # Dropout parameters
+        dnn_dropout: Dropout rate for DNN layers (default: 0.5)
+        lstm_dropout: Dropout rate for LSTM layers (default: 0.1)
     """
     _LOG.info("TRAIN_TABULAR started")
     t0 = time.time()
@@ -715,7 +1015,6 @@ def train(
         _LOG.info(f"{device=}")
         torch.set_default_dtype(torch.float32)
 
-        # Log training settings
         _LOG.info("=== TRAINING SETTINGS ===")
         _LOG.info(f"Mixed Precision: {use_mixed_precision}")
         _LOG.info(f"Gradient Clipping: {gradient_clip_norm}")
@@ -723,6 +1022,9 @@ def train(
         _LOG.info(f"Label Smoothing: {label_smoothing}")
         _LOG.info(f"EMA: {use_ema} (decay={ema_decay})")
         _LOG.info(f"Focal Loss: {use_focal_loss}")
+        _LOG.info(f"Custom Init: {use_custom_initialization}")
+        _LOG.info(f"DNN Dropout: {dnn_dropout}")
+        _LOG.info(f"LSTM Dropout: {lstm_dropout}")
 
         # Data preparation
         has_context = workspace.ctx_stats.path.exists()
@@ -744,20 +1046,13 @@ def train(
         max_training_time = max(0.0, max_training_time) * 60  # convert to seconds
         _LOG.info(f"{max_training_time=}s")
         max_epochs = max(0.0, max_epochs)
-        max_epochs_cap = math.ceil((trn_cnt + val_cnt) / 50)
-        if max_epochs_cap < max_epochs:
-            _LOG.info(f"{max_epochs=} -> max_epochs={max_epochs_cap} due to small sample size")
-            max_epochs = max_epochs_cap
-        else:
-            _LOG.info(f"{max_epochs=}")
+        _LOG.info(f"{max_epochs=}")
             
         model_sizes = {
             "MOSTLY_AI/Small": ModelSize.S,
             "MOSTLY_AI/Medium": ModelSize.M,
             "MOSTLY_AI/Large": ModelSize.L,
             "MOSTLY_AI/XLarge": ModelSize.XL,
-            "MOSTLY_AI/XXLarge": ModelSize.XXL,
-            "MOSTLY_AI/XXXLarge": ModelSize.XXXL,
         }
         if model not in model_sizes:
             raise ValueError(f"model {model} not supported")
@@ -808,6 +1103,8 @@ def train(
                 model_size=model_size,
                 column_order=trn_column_order,
                 device=device,
+                dnn_dropout=dnn_dropout,
+                lstm_dropout=lstm_dropout,
                 with_dp=with_dp,
             )
         else:
@@ -818,6 +1115,8 @@ def train(
                 model_size=model_size,
                 column_order=trn_column_order,
                 device=device,
+                dnn_dropout=dnn_dropout,
+                lstm_dropout=lstm_dropout,
             )
         _LOG.info(f"model class: {argn.__class__.__name__}")
 
@@ -836,7 +1135,48 @@ def train(
         else:
             _LOG.info("remove existing checkpoint files")
             model_checkpoint.clear_checkpoint()
-
+            
+            # Apply custom weight initialization for new models
+            if use_custom_initialization:
+                _LOG.info("applying custom weight initialization")
+    
+                # Optionally prepare training targets for class priors
+                train_targets = None
+                if compute_class_priors:
+                    try:
+                        disable_progress_bar()
+                        sample_data = load_dataset("parquet", data_files=[str(p) for p in workspace.encoded_data_trn.fetch_all()])["train"]
+                        sample_data = sample_data[:10000]
+            
+                        train_targets = {}
+                        for col in tgt_cardinalities.keys():
+                            # Handle both sequential and flat data
+                            col_data = sample_data[col]
+                            if is_sequential:
+                                # Flatten sequences for class counting
+                                flattened = []
+                                for seq in col_data:
+                                    if isinstance(seq, list):
+                                        flattened.extend(seq)
+                                    else:
+                                        flattened.append(seq)
+                                train_targets[col] = torch.tensor(flattened, dtype=torch.int64)
+                            else:
+                                train_targets[col] = torch.tensor(col_data, dtype=torch.int64)
+            
+                    except Exception as e:
+                        _LOG.warning(f"could not compute class priors: {e}")
+                        train_targets = None
+    
+                # Apply initialization - now passing cardinalities to ensure proper sizing
+                apply_tabular_argn_initialization(
+                    model=argn,
+                    model_size=model,
+                    cardinalities=tgt_cardinalities,
+                    train_targets=train_targets,
+                    use_conservative_init=conservative_initialization,
+                )
+                
         # Handle progress state
         last_progress_message = progress.get_last_progress_message()
         if last_progress_message and model_state_strategy == ModelStateStrategy.resume:
@@ -864,6 +1204,8 @@ def train(
             "model_id": model,
             "model_units": model_units,
             "enable_flexible_generation": enable_flexible_generation,
+            "dnn_dropout": dnn_dropout,
+            "lstm_dropout": lstm_dropout,
         }
         workspace.model_configs.write(model_configs)
 
@@ -947,7 +1289,6 @@ def train(
             params=argn.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay,
-            # eps=1e-8,
         )
 
         # Setup learning rate scheduler
@@ -1333,6 +1674,79 @@ def train(
     _LOG.info(f"TRAIN_TABULAR finished in {time.time() - t0:.2f}s")
 
 
+def _calculate_sample_losses(
+    model: FlatModel | SequentialModel | GradSampleModule, 
+    data: dict[str, torch.Tensor],
+    device: torch.device,
+    use_mixed_precision: bool = True,
+    use_focal_loss: bool = False,
+    focal_alpha: float = 1.0,
+    focal_gamma: float = 2.0,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """Calculate per-sample losses with configurable loss functions."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FutureWarning, message="Using a non-full backward hook*")
+        
+        # Forward pass with mixed precision if enabled
+        if use_mixed_precision:
+            device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+            with autocast(device_type=device_type):
+                output, _ = model(data, mode="trn")
+        else:
+            output, _ = model(data, mode="trn")
+
+    # Get target columns
+    tgt_cols = (
+        list(model.tgt_cardinalities.keys())
+        if not isinstance(model, GradSampleModule)
+        else model._module.tgt_cardinalities.keys()
+    )
+    
+    # Choose loss function
+    if use_focal_loss:
+        criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction="none")
+    else:
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing, reduction="none")
+    
+    # Handle sequential vs flat models
+    if isinstance(model, SequentialModel) or (
+        isinstance(model, GradSampleModule) and isinstance(model._module, SequentialModel)
+    ):
+        slen_cols = [k for k in data if k.startswith(SLEN_SUB_COLUMN_PREFIX)]
+        
+        # Generate masks for SLEN and time step
+        slen_mask = torch.zeros_like(data[slen_cols[0]], dtype=torch.int64)
+        for slen_col in slen_cols:
+            slen_mask |= data[slen_col] != 0
+        slen_mask = slen_mask.squeeze(-1)
+        time_step_mask = torch.zeros_like(slen_mask, dtype=torch.int64)
+        time_step_mask[:, 0] = 10  # Emphasize first time step
+        
+        # Calculate per column losses
+        sidx_cols = {k for k in data if k.startswith(SIDX_SUB_COLUMN_PREFIX)}
+        sdec_cols = {k for k in data if k.startswith(SDEC_SUB_COLUMN_PREFIX)}
+        losses_by_column = []
+        
+        for col in tgt_cols:
+            if col in slen_cols:
+                mask = time_step_mask
+            elif col in sidx_cols or col in sdec_cols:
+                mask = torch.zeros_like(slen_mask, dtype=torch.int64)
+            else:
+                mask = slen_mask
+
+            column_loss = criterion(output[col].transpose(1, 2), data[col].squeeze(2))
+            masked_loss = torch.sum(column_loss * mask, dim=1) / torch.clamp(torch.sum(mask, dim=1), min=1)
+            losses_by_column.append(masked_loss)
+    else:
+        losses_by_column = [criterion(output[col], data[col].squeeze(1)) for col in tgt_cols]
+    
+    # Sum up column level losses
+    losses = torch.sum(torch.stack(losses_by_column, dim=0), dim=0)
+    return losses
+
+
 __all__ = [
     "train",
     "EMAModel", 
@@ -1343,4 +1757,12 @@ __all__ = [
     "ImprovedEarlyStopper",
     "EarlyStopperConfig",
     "TabularModelCheckpoint",
+    "apply_tabular_argn_initialization",
+    "init_embedding_weights",
+    "init_lstm_weights", 
+    "init_linear_weights",
+    "init_final_prediction_layer",
+    "create_class_priors_from_data",
+    "get_initialization_config",
+    "initialize_tabular_argn_weights",
 ]

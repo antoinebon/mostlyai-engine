@@ -48,17 +48,15 @@ _LOG = logging.getLogger(__name__)
 
 class ModelSize(str, Enum):
     S = "S"
-    M = "M" 
+    M = "M"
     L = "L"
     XL = "XL"
-    XXL = "XXL"
-    XXXL = "XXXL"
 
 
 ModelSizeOrUnits = ModelSize | dict[str, list[int]]
 
 
-def get_no_of_model_parameters(model) -> int:
+def get_no_of_model_parameters(model: nn.Module) -> int:
     trainable_count = sum([np.prod(p.shape) for p in model.parameters()])
     return trainable_count
 
@@ -114,73 +112,57 @@ def get_model_units(model: nn.Module) -> dict[str, Any]:
 ####################
 
 
-class ModelSize(str, Enum):
-    S = "S"
-    M = "M" 
-    L = "L"
-    XL = "XL"
-    XXL = "XXL"
-    XXXL = "XXXL"
-
 def _regressor_heuristic(id: str, model_size: ModelSizeOrUnits, dim_input: int, cardinality: int) -> list[int]:
     if isinstance(model_size, dict):
         return model_size[id]
-    
+
     model_size_layers = dict(
-        S=[4], 
-        M=[16], 
+        S=[4],
+        M=[16],
         L=[16, 16],
-        XL=[32, 32, 32],           # Deeper + wider
-        XXL=[64, 64, 64, 64],      # Even deeper + wider  
-        XXXL=[128, 128, 128, 128, 128]  # Very deep + wide
+        XL=[32, 32, 32],
     )
-    
+
     dims = [dim_input]
     layers = model_size_layers[model_size]
-    
-    # More aggressive scaling for larger models
+
+    # first layers depend on input dimension
     for idx, unit in enumerate(layers[:-1]):
         coefficient = round(np.log(max(dims[idx], np.e)))
         dims.append(unit * coefficient)
-    
+
     # Last layer depends on cardinality
     unit = layers[-1]
     coefficient = round(np.log(max(cardinality, np.e)))
     dims.append(unit * coefficient)
     return dims[1:]
 
+
 def _embedding_heuristic(id: str, model_size: ModelSizeOrUnits, dim_input: int) -> int:
     if isinstance(model_size, dict):
         return model_size[id]
-    
+
     model_size_output_dim = dict(
         S=max(10, int(2 * np.ceil(dim_input**0.15))),
         M=max(10, int(3 * np.ceil(dim_input**0.25))),
         L=max(10, int(4 * np.ceil(dim_input**0.33))),
-        XL=max(10, int(6 * np.ceil(dim_input**0.4))),      # More aggressive scaling
-        XXL=max(10, int(8 * np.ceil(dim_input**0.45))),
-        XXXL=max(10, int(12 * np.ceil(dim_input**0.5))),
+        XL=max(10, int(5 * np.ceil(dim_input**0.4))),  # More aggressive scaling
     )
     return min(dim_input, model_size_output_dim[model_size])
+
 
 def _history_heuristic(id: str, model_size: ModelSizeOrUnits, dim_input: int, seq_len_median: int) -> list[int]:
     if isinstance(model_size, dict):
         return model_size[id]
-    
-    model_size_layers = dict(
-        S=[16], 
-        M=[64], 
-        L=[128, 128],
-        XL=[256, 256, 256],           # Much wider + deeper
-        XXL=[512, 512, 512, 512],     # Very wide + deep
-        XXXL=[1024, 1024, 1024, 1024, 1024]  # Extremely wide + deep
-    )
-    
+
+    model_size_layers = dict(S=[16], M=[64], L=[128, 128], XL=[256, 256, 256])
+
     layers = model_size_layers[model_size]
     coefficient = round(np.log(max(dim_input * seq_len_median, np.e)))
-    
+
     dims = [unit * coefficient for unit in layers]
     return dims
+
 
 def _column_embedding_heuristic(
     id: str,
@@ -191,60 +173,52 @@ def _column_embedding_heuristic(
 ) -> int:
     if isinstance(model_size, dict):
         return model_size.get(id, dim_input)
-    
+
     model_size_output_dim = dict(
         S=int(4 + n_sub_cols),
         M=int(10 + n_sub_cols),
         L=int(16 + n_sub_cols),
-        XL=int(32 + n_sub_cols * 2),      # More aggressive sub-column scaling
-        XXL=int(64 + n_sub_cols * 3),     # Even more aggressive
-        XXXL=int(128 + n_sub_cols * 4),   # Very aggressive
-    )
-    
+        XL=int(24 + n_sub_cols),
+   )
+
     compress = compress_enabled and n_sub_cols > 2
     dim_output = model_size_output_dim[model_size] if compress else dim_input
     # dim_output should always be at most dim_input
     return min(dim_input, dim_output)
 
+
 def _flat_context_heuristic(id: str, model_size: ModelSizeOrUnits, dim_input: int) -> list[int]:
     if isinstance(model_size, dict):
         return model_size[id]
-    
+
     model_size_layers = dict(
-        S=[8], 
-        M=[64], 
+        S=[8],
+        M=[64],
         L=[128],
-        XL=[256, 256],                # Add depth + width
-        XXL=[512, 512, 256],          # More depth + width
-        XXXL=[1024, 1024, 512, 256]   # Very deep + wide with tapering
-    )
-    
+        XL=[256],
+   )
+
     layers = model_size_layers[model_size]
     coefficient = round(np.log(max(dim_input, np.e)))
-    
+
     dims = [unit * coefficient for unit in layers]
     return dims
+
 
 def _sequential_context_heuristic(
     id: str, model_size: ModelSizeOrUnits, dim_input: int, seq_len_median: int
 ) -> list[int]:
     if isinstance(model_size, dict):
         return model_size[id]
-    
-    model_size_layers = dict(
-        S=[8], 
-        M=[32], 
-        L=[64, 64],
-        XL=[128, 128, 128],           # Much deeper + wider
-        XXL=[256, 256, 256, 256],     # Very deep + wide
-        XXXL=[512, 512, 512, 512, 256]  # Extremely deep + wide with tapering
-    )
-    
+
+    model_size_layers = dict(S=[8], M=[32], L=[64, 64], XL=[128, 128, 128])
+
     layers = model_size_layers[model_size]
     coefficient = round(np.log(max(dim_input * seq_len_median, np.e)))
-    
+
     dims = [unit * coefficient for unit in layers]
     return dims
+
 
 #######################
 ### BUILDING BLOCKS ###
@@ -416,6 +390,7 @@ class FlatContextCompressor(nn.Module):
         model_size: ModelSizeOrUnits,
         ctxflt_cardinalities: dict[str, int],
         device: torch.device,
+        dnn_dropout: float,
     ):
         super().__init__()
 
@@ -424,7 +399,7 @@ class FlatContextCompressor(nn.Module):
         self.device = device
 
         self.compressor_layers = nn.ModuleDict()
-        self.dropout = nn.Dropout(p=0.25)
+        self.dropout = nn.Dropout(p=dnn_dropout)
 
         # flat context embedding layers
         self.embedders = Embedders(
@@ -476,6 +451,8 @@ class SequentialContextCompressor(nn.Module):
         ctxseq_cardinalities: dict[str, int],
         ctxseq_len_median: dict[str, int],
         device: torch.device,
+        dnn_dropout: float,
+        lstm_dropout: float,
         with_dp: bool = False,
     ):
         super().__init__()
@@ -484,7 +461,6 @@ class SequentialContextCompressor(nn.Module):
         self.ctxseq_cardinalities = ctxseq_cardinalities
         self.ctxseq_len_median = ctxseq_len_median
         self.device = device
-        dropout_rate = 0.25
 
         self.ctxseq_table_sub_columns = get_sub_columns_nested_from_cardinalities(
             self.ctxseq_cardinalities, groupby="tables"
@@ -492,7 +468,7 @@ class SequentialContextCompressor(nn.Module):
 
         self.embedders = nn.ModuleDict()
         self.compressor_layers = nn.ModuleDict()
-        self.dropout = nn.Dropout(p=dropout_rate)
+        self.dropout = nn.Dropout(p=dnn_dropout)
 
         self.dim_outputs = []
         for table, sub_columns in self.ctxseq_table_sub_columns.items():
@@ -523,7 +499,7 @@ class SequentialContextCompressor(nn.Module):
                 input_size=dim_input,
                 hidden_size=hidden_size,
                 num_layers=num_layers,
-                dropout=dropout_rate if num_layers > 1 else 0.0,
+                dropout=lstm_dropout,
                 batch_first=True,
                 bidirectional=bidirectional,
             )
@@ -569,6 +545,8 @@ class ContextCompressor(nn.Module):
         ctx_cardinalities: dict[str, int],
         ctxseq_len_median: dict[str, int],
         device: torch.device,
+        dnn_dropout: float,
+        lstm_dropout: float,
         with_dp: bool = False,
     ):
         super().__init__()
@@ -583,6 +561,7 @@ class ContextCompressor(nn.Module):
             model_size=self.model_size,
             ctxflt_cardinalities=self.ctxflt_cardinalities,
             device=device,
+            dnn_dropout=dnn_dropout,
         )
 
         # sequential context(s)
@@ -591,6 +570,8 @@ class ContextCompressor(nn.Module):
             ctxseq_cardinalities=self.ctxseq_cardinalities,
             ctxseq_len_median=self.ctxseq_len_median,
             device=device,
+            dnn_dropout=dnn_dropout,
+            lstm_dropout=lstm_dropout,
             with_dp=with_dp,
         )
 
@@ -610,6 +591,8 @@ class HistoryCompressor(nn.Module):
         embedding_dims: list[int],
         seq_len_median: int,
         device: torch.device,
+        dnn_dropout: float,
+        lstm_dropout: float,
         with_dp: bool = False,
     ):
         super().__init__()
@@ -618,10 +601,9 @@ class HistoryCompressor(nn.Module):
         self.embedding_dims = embedding_dims
         self.seq_len_median = seq_len_median
         self.device = device
-        dropout_rate = 0.25
 
         self.compressor_layers = nn.ModuleDict()
-        self.dropout = nn.Dropout(p=dropout_rate)
+        self.dropout = nn.Dropout(p=dnn_dropout)
 
         dim_input = sum(embedding_dims)
         dims = _history_heuristic(
@@ -638,7 +620,7 @@ class HistoryCompressor(nn.Module):
             input_size=dim_input,
             hidden_size=hidden_size,
             num_layers=num_layers,
-            dropout=dropout_rate if num_layers > 1 else 0.0,
+            dropout=lstm_dropout,
             batch_first=True,
         )
         self.set(compressor_layer)
@@ -672,6 +654,7 @@ class Regressors(nn.Module):
         embedding_dims: list[int],
         column_embedding_dims: list[int],
         device: torch.device,
+        dnn_dropout: float,
     ):
         super().__init__()
 
@@ -689,7 +672,7 @@ class Regressors(nn.Module):
         self.dims_output = {}
 
         self.regressors = nn.ModuleDict()
-        self.dropout = nn.Dropout(p=0.25)
+        self.dropout = nn.Dropout(p=dnn_dropout)
 
         for sub_column, lookup in self.sub_columns_lookup.items():
             # collect previous sub column embedding dims for current column
@@ -910,6 +893,8 @@ class FlatModel(nn.Module):
         model_size: ModelSizeOrUnits,
         column_order: list[str] | None,
         device: torch.device,
+        dnn_dropout: float = 0.25,
+        lstm_dropout: float = 0.0,
     ):
         super().__init__()
 
@@ -931,6 +916,8 @@ class FlatModel(nn.Module):
             ctx_cardinalities=self.ctx_cardinalities,
             ctxseq_len_median=self.ctxseq_len_median,
             device=device,
+            dnn_dropout=dnn_dropout,
+            lstm_dropout=lstm_dropout,
         )
 
         # sub column embeddings
@@ -956,6 +943,7 @@ class FlatModel(nn.Module):
             embedding_dims=self.embedders.dims,
             column_embedding_dims=self.column_embedders.dims,
             device=self.device,
+            dnn_dropout=dnn_dropout,
         )
 
         # predictors
@@ -1191,6 +1179,8 @@ class SequentialModel(nn.Module):
         model_size: ModelSizeOrUnits,
         column_order: list[str] | None,
         device: torch.device,
+        dnn_dropout: float = 0.5,
+        lstm_dropout: float = 0.1,
         with_dp: bool = False,
     ):
         super().__init__()
@@ -1215,6 +1205,8 @@ class SequentialModel(nn.Module):
             ctx_cardinalities=ctx_cardinalities,
             ctxseq_len_median=ctxseq_len_median,
             device=device,
+            dnn_dropout=dnn_dropout,
+            lstm_dropout=lstm_dropout,
             with_dp=with_dp,
         )
 
@@ -1239,6 +1231,8 @@ class SequentialModel(nn.Module):
             embedding_dims=self.embedders.dims,
             seq_len_median=self.tgt_seq_len_median,
             device=self.device,
+            dnn_dropout=dnn_dropout,
+            lstm_dropout=lstm_dropout,
             with_dp=with_dp,
         )
 
@@ -1258,6 +1252,7 @@ class SequentialModel(nn.Module):
             embedding_dims=self.embedders.dims,
             column_embedding_dims=self.column_embedders.dims,
             device=self.device,
+            dnn_dropout=dnn_dropout,
         )
 
         # predictors

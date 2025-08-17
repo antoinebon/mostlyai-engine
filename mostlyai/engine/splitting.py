@@ -103,7 +103,6 @@ def split(
         workspace_dir: Path to the workspace directory where files will be created.
         update_progress: A custom progress callback.
     """
-    breakpoint()
     _LOG.info("SPLIT started")
     t0 = time.time()
     with ProgressCallbackWrapper(update_progress) as progress:

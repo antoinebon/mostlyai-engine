@@ -1030,7 +1030,7 @@ def generate(
                             for c in context
                         ]
                         history = history[continue_mask, ...]
-                        history_state = tuple(h[:, continue_mask, ...] for h in history_state)
+                        history_state = tuple(h[:, continue_mask, ...] for h in history_state if h is not None)
                     # accumulate outputs in memory
                     buffer.add((out_pt, step_ctx_keys))
                     # increment progress by 1 for each step
